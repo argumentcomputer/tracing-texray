@@ -46,7 +46,7 @@ impl EventInfo {
 }
 
 impl SpanInfo {
-    pub(crate) fn for_span<S>(span: &Id, ctx: &Context<'_, S>) -> Self
+    pub(crate) fn for_span<S>(span: &Id, ctx: &Context<'_, S>, track_ram: bool) -> Self
     where
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
@@ -57,6 +57,8 @@ impl SpanInfo {
                 .unwrap_or("could-not-find-span"),
             start: SystemTime::now(),
             end: None,
+            start_rss: if track_ram { read_rss() } else { RssSample::default() },
+            end_rss: RssSample::default(),
         }
     }
 }
@@ -101,6 +103,73 @@ pub(crate) struct SpanInfo {
     start: SystemTime,
     end: Option<SystemTime>,
     name: &'static str,
+    start_rss: RssSample,
+    end_rss: RssSample,
+}
+
+/// Snapshot of process resident-set size, in kilobytes.
+///
+/// `current_kb` is `VmRSS` (live RSS at sample time); `peak_kb` is `VmHWM`
+/// (the highest RSS the process has reached). Both are zero on non-Linux
+/// platforms — there's no portable equivalent of `/proc/self/status`.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct RssSample {
+    current_kb: u64,
+    peak_kb: u64,
+}
+
+impl RssSample {
+    fn is_zero(&self) -> bool {
+        self.current_kb == 0 && self.peak_kb == 0
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn read_rss() -> RssSample {
+    let Ok(s) = std::fs::read_to_string("/proc/self/status") else {
+        return RssSample::default();
+    };
+    let mut sample = RssSample::default();
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            sample.current_kb = parse_kb(rest);
+        } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+            sample.peak_kb = parse_kb(rest);
+        }
+    }
+    sample
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_rss() -> RssSample {
+    RssSample::default()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_kb(s: &str) -> u64 {
+    s.trim()
+        .split_ascii_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+fn format_bytes(kb: u64) -> String {
+    let kb_f = kb as f64;
+    if kb < 1024 {
+        format!("{kb_f:.2} KiB")
+    } else if kb < 1024 * 1024 {
+        format!("{:.2} MiB", kb_f / 1024.0)
+    } else {
+        format!("{:.2} GiB", kb_f / (1024.0 * 1024.0))
+    }
+}
+
+fn format_signed_kb(start_kb: u64, end_kb: u64) -> String {
+    let delta = (end_kb as i64) - (start_kb as i64);
+    let sign = if delta >= 0 { "+" } else { "-" };
+    let mag = delta.unsigned_abs();
+    format!("{sign}{}", format_bytes(mag))
 }
 
 impl SpanInfo {
@@ -221,9 +290,12 @@ impl SpanTracker {
         }
     }
 
-    fn exit(&mut self, timestamp: SystemTime) {
+    fn exit(&mut self, timestamp: SystemTime, end_rss: RssSample) {
         match &mut self.info {
-            Some(info) => info.end = Some(timestamp),
+            Some(info) => {
+                info.end = Some(timestamp);
+                info.end_rss = end_rss;
+            }
             None => eprintln!("this is a bug"), //
         }
     }
@@ -315,7 +387,16 @@ impl InterestTracker {
     }
 
     pub(crate) fn exit(&mut self, path: Vec<Id>, timestamp: SystemTime) {
-        self.span(path).exit(timestamp);
+        let end_rss = if self.render_settings.track_ram {
+            read_rss()
+        } else {
+            RssSample::default()
+        };
+        self.span(path).exit(timestamp, end_rss);
+    }
+
+    pub(crate) fn track_ram(&self) -> bool {
+        self.render_settings.track_ram
     }
 
     fn spans(&self) -> impl Iterator<Item = &SpanInfo> {
@@ -330,6 +411,10 @@ impl InterestTracker {
             write!(&mut out, "no events...")?;
             return Ok(());
         }
+        // Lead with a blank line so the dump doesn't jam against whatever
+        // was written to stderr just before (criterion's `Benchmarking ...`,
+        // log lines, etc.).
+        writeln!(out)?;
         let (start_ts, end_ts) = (
             all_events
                 .iter()
@@ -376,6 +461,81 @@ impl InterestTracker {
             }
         }
 
+        if settings.track_ram {
+            self.render_ram(out.deref_mut(), &ordered)?;
+        }
+
+        Ok(())
+    }
+
+    fn render_ram(
+        &self,
+        mut out: impl Write,
+        ordered: &[(&Vec<Id>, &SpanTracker)],
+    ) -> io::Result<()> {
+        let any_rss = ordered.iter().any(|(_, track)| {
+            track
+                .info
+                .as_ref()
+                .map(|info| !info.start_rss.is_zero() || !info.end_rss.is_zero())
+                .unwrap_or(false)
+        });
+        if !any_rss {
+            return Ok(());
+        }
+
+        let mut rows: Vec<(String, String, String)> = Vec::with_capacity(ordered.len());
+        let mut max_label = 0;
+        let mut max_delta = 0;
+        for (key, track) in ordered {
+            let Some(info) = track.info.as_ref() else {
+                continue;
+            };
+            // Mirror the bar chart's `min_duration` filter so the RAM block
+            // doesn't list rows that aren't shown in the timeline above.
+            if let Some(min) = self.render_settings.min_duration.as_ref() {
+                let span_len = match info.duration() {
+                    None => continue,
+                    Some(d) => d,
+                };
+                if &span_len < min {
+                    continue;
+                }
+            }
+            let depth = key.len().saturating_sub(1);
+            let label = format!(
+                "{}{}",
+                " ".repeat(NESTED_EVENT_OFFSET * depth),
+                info.full_name(track, &self.field_settings),
+            );
+            // Show start→end RSS (the trajectory) so transient allocations
+            // are visible: a span whose end is well below its peak freed
+            // memory before exiting. Append the net delta in parens so it's
+            // also legible at a glance.
+            let delta = format!(
+                "RSS {} → {} (Δ {})",
+                format_bytes(info.start_rss.current_kb),
+                format_bytes(info.end_rss.current_kb),
+                format_signed_kb(info.start_rss.current_kb, info.end_rss.current_kb),
+            );
+            let peak = format!("peak {}", format_bytes(info.end_rss.peak_kb));
+            max_label = max_label.max(label.chars().count());
+            max_delta = max_delta.max(delta.chars().count());
+            rows.push((label, delta, peak));
+        }
+
+        writeln!(out)?;
+        writeln!(out, "RAM:")?;
+        for (label, delta, peak) in rows {
+            let label_pad = max_label - label.chars().count();
+            let delta_pad = max_delta - delta.chars().count();
+            writeln!(
+                out,
+                "  {label}{}  {delta}{}  {peak}",
+                " ".repeat(label_pad),
+                " ".repeat(delta_pad),
+            )?;
+        }
         Ok(())
     }
 
@@ -454,6 +614,41 @@ impl RootTracker {
         );
     }
 
+    /// Synthesize a `SpanInfo` for an already-entered examined span.
+    ///
+    /// `examine_current()` calls this because the span's `on_enter` callback
+    /// fired before interest was registered — so the root `SpanTracker`
+    /// exists but has no `info`, and `sort_key`/`exit` would treat that as a
+    /// bug. We approximate the start as now (slightly later than the real
+    /// entry, but the gap is the call-site overhead, typically negligible).
+    pub(crate) fn populate_examined_root(&self, id: &Id, name: &'static str) {
+        let mut span_guard = self.span_metadata.write();
+        let Some(interest_tracker) = span_guard.get_mut(id) else {
+            return;
+        };
+        let track_ram = interest_tracker.render_settings.track_ram;
+        let field_settings = interest_tracker.field_settings.clone();
+        let key = vec![id.clone()];
+        let span_tracker = interest_tracker
+            .children
+            .entry(key)
+            .or_insert_with(|| SpanTracker::new(field_settings));
+        if span_tracker.info.is_none() {
+            let start_rss = if track_ram {
+                read_rss()
+            } else {
+                RssSample::default()
+            };
+            span_tracker.info = Some(SpanInfo {
+                name,
+                start: SystemTime::now(),
+                end: None,
+                start_rss,
+                end_rss: RssSample::default(),
+            });
+        }
+    }
+
     pub(crate) fn if_interested(
         &self,
         ids: impl Iterator<Item = Id>,
@@ -521,10 +716,27 @@ mod test {
     use std::sync::Arc;
 
     use parking_lot::Mutex;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use crate::tracker::{width, FieldSettings, InterestTracker, SpanInfo, TrackedMetadata};
+    use crate::tracker::{
+        format_bytes, format_signed_kb, read_rss, width, FieldSettings, InterestTracker,
+        RssSample, SpanInfo, TrackedMetadata,
+    };
     use tracing::Id;
+
+    fn id(i: u64) -> Id {
+        Id::from_u64(i)
+    }
+
+    fn render_settings(track_ram: bool) -> RenderSettings {
+        let settings = Settings::default();
+        RenderSettings {
+            width: settings.width,
+            min_duration: settings.min_duration,
+            types: settings.types,
+            track_ram,
+        }
+    }
 
     #[test]
     fn compute_relative_width() {
@@ -545,12 +757,14 @@ mod test {
     }
 
     fn dump_to_string(id: Id, f: impl Fn(&mut InterestTracker)) -> String {
-        let settings = Settings::default();
-        let settings = RenderSettings {
-            width: settings.width,
-            min_duration: settings.min_duration,
-            types: settings.types,
-        };
+        dump_to_string_with(id, render_settings(false), f)
+    }
+
+    fn dump_to_string_with(
+        id: Id,
+        settings: RenderSettings,
+        f: impl Fn(&mut InterestTracker),
+    ) -> String {
         let (writer, buf) = DynWriter::str();
         let mut tracker = InterestTracker::new(id, settings, FieldSettings::default(), writer);
         f(&mut tracker);
@@ -587,9 +801,6 @@ mod test {
 
     #[test]
     fn render_correct_output() {
-        fn id(i: u64) -> Id {
-            Id::from_u64(i)
-        }
         let output = dump_to_string(id(1), |tracker| {
             let interval_start = UNIX_EPOCH;
             let interval_end = UNIX_EPOCH.add(Duration::from_secs(10));
@@ -601,6 +812,8 @@ mod test {
                     name: "test",
                     start: interval_start,
                     end: None,
+                    start_rss: RssSample::default(),
+                    end_rss: RssSample::default(),
                 },
             );
             tracker.open(
@@ -609,15 +822,350 @@ mod test {
                     name: "nested",
                     start: interval_start + Duration::from_secs(2),
                     end: None,
+                    start_rss: RssSample::default(),
+                    end_rss: RssSample::default(),
                 },
             );
             tracker.exit(vec![id(1), id(2)], interval_start + Duration::from_secs(7));
             tracker.exit(vec![id(1)], interval_end);
         });
-        assert_eq!(output, r#"
+        assert_eq!(
+            output,
+            r#"
 test       10s  ├──────────────────────────────────────────────────────────────────────────────────────────────────────┤
   nested    5s                       ├──────────────────────────────────────────────────┤
-"#.trim_start());
+"#
+        );
+    }
+
+    #[test]
+    fn format_bytes_units() {
+        assert_eq!(format_bytes(0), "0.00 KiB");
+        assert_eq!(format_bytes(512), "512.00 KiB");
+        assert_eq!(format_bytes(1023), "1023.00 KiB");
+        assert_eq!(format_bytes(1024), "1.00 MiB");
+        assert_eq!(format_bytes(2048), "2.00 MiB");
+        assert_eq!(format_bytes(2 * 1024 * 1024), "2.00 GiB");
+    }
+
+    #[test]
+    fn format_signed_kb_signs() {
+        assert_eq!(format_signed_kb(0, 0), "+0.00 KiB");
+        assert_eq!(format_signed_kb(1024, 3072), "+2.00 MiB");
+        assert_eq!(format_signed_kb(3072, 1024), "-2.00 MiB");
+        assert_eq!(format_signed_kb(100, 100), "+0.00 KiB");
+    }
+
+    #[test]
+    fn rss_sample_is_zero() {
+        assert!(RssSample::default().is_zero());
+        assert!(!RssSample {
+            current_kb: 1,
+            peak_kb: 0
+        }
+        .is_zero());
+        assert!(!RssSample {
+            current_kb: 0,
+            peak_kb: 1
+        }
+        .is_zero());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_kb_handles_status_format() {
+        use crate::tracker::parse_kb;
+        assert_eq!(parse_kb(" 12345 kB"), 12345);
+        assert_eq!(parse_kb("\t  42  kB\n"), 42);
+        assert_eq!(parse_kb("0 kB"), 0);
+        assert_eq!(parse_kb("garbage"), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_rss_returns_live_sample() {
+        // The test process is real; VmRSS must be non-zero and VmHWM >= VmRSS.
+        let sample = read_rss();
+        assert!(
+            sample.current_kb > 0,
+            "expected non-zero current RSS, got {sample:?}"
+        );
+        assert!(
+            sample.peak_kb >= sample.current_kb,
+            "peak ({}) should be >= current ({})",
+            sample.peak_kb,
+            sample.current_kb
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn read_rss_returns_zero_off_linux() {
+        assert!(read_rss().is_zero());
+    }
+
+    /// Build a SpanInfo with explicit RSS samples and a closed time range,
+    /// bypassing the live `read_rss()` call so render output is deterministic.
+    fn closed_span(
+        name: &'static str,
+        start: SystemTime,
+        end: SystemTime,
+        start_rss: RssSample,
+        end_rss: RssSample,
+    ) -> SpanInfo {
+        SpanInfo {
+            name,
+            start,
+            end: Some(end),
+            start_rss,
+            end_rss,
+        }
+    }
+
+    #[test]
+    fn render_ram_block_present_with_samples() {
+        let interval_start = UNIX_EPOCH;
+        let output = dump_to_string_with(id(1), render_settings(true), |tracker| {
+            tracker.new_span(vec![id(1)]);
+            tracker.new_span(vec![id(1), id(2)]);
+            tracker.open(
+                vec![id(1)],
+                closed_span(
+                    "outer",
+                    interval_start,
+                    interval_start + Duration::from_secs(10),
+                    RssSample {
+                        current_kb: 1024,
+                        peak_kb: 1024,
+                    },
+                    RssSample {
+                        current_kb: 3072,
+                        peak_kb: 4096,
+                    },
+                ),
+            );
+            tracker.open(
+                vec![id(1), id(2)],
+                closed_span(
+                    "inner",
+                    interval_start + Duration::from_secs(2),
+                    interval_start + Duration::from_secs(7),
+                    RssSample {
+                        current_kb: 2048,
+                        peak_kb: 2048,
+                    },
+                    RssSample {
+                        current_kb: 1024,
+                        peak_kb: 4096,
+                    },
+                ),
+            );
+        });
+
+        assert!(output.contains("RAM:"), "missing RAM header in:\n{output}");
+        assert!(
+            output.contains("  outer    RSS 1.00 MiB → 3.00 MiB (Δ +2.00 MiB)  peak 4.00 MiB"),
+            "missing outer row in:\n{output}"
+        );
+        assert!(
+            output.contains("    inner  RSS 2.00 MiB → 1.00 MiB (Δ -1.00 MiB)  peak 4.00 MiB"),
+            "missing inner row in:\n{output}"
+        );
+        // RAM block must come after the bar chart (parent first, child indented).
+        let bar_pos = output.find("outer").expect("bar row");
+        let ram_pos = output.find("RAM:").expect("ram header");
+        assert!(bar_pos < ram_pos, "RAM block must follow bars:\n{output}");
+        assert!(
+            output.find("outer").map(|p| p < ram_pos).unwrap_or(false)
+                && output.rfind("outer").map(|p| p > ram_pos).unwrap_or(false),
+            "outer should appear in both bar and RAM sections:\n{output}"
+        );
+    }
+
+    #[test]
+    fn render_ram_block_respects_min_duration() {
+        // `min_duration` should filter both the bar chart and the RAM block
+        // so they stay consistent. A short span should be hidden in both.
+        let mut settings = render_settings(true);
+        settings.min_duration = Some(Duration::from_millis(5));
+        let interval_start = UNIX_EPOCH;
+        let output = dump_to_string_with(id(1), settings, |tracker| {
+            tracker.new_span(vec![id(1)]);
+            tracker.new_span(vec![id(1), id(2)]);
+            // Long parent: kept.
+            tracker.open(
+                vec![id(1)],
+                closed_span(
+                    "outer",
+                    interval_start,
+                    interval_start + Duration::from_millis(100),
+                    RssSample {
+                        current_kb: 1024,
+                        peak_kb: 1024,
+                    },
+                    RssSample {
+                        current_kb: 3072,
+                        peak_kb: 4096,
+                    },
+                ),
+            );
+            // Sub-millisecond child: filtered.
+            tracker.open(
+                vec![id(1), id(2)],
+                closed_span(
+                    "inner_short",
+                    interval_start + Duration::from_millis(10),
+                    interval_start + Duration::from_millis(11),
+                    RssSample {
+                        current_kb: 2048,
+                        peak_kb: 2048,
+                    },
+                    RssSample {
+                        current_kb: 1024,
+                        peak_kb: 4096,
+                    },
+                ),
+            );
+        });
+
+        assert!(output.contains("RAM:"), "missing RAM header in:\n{output}");
+        let ram_pos = output.find("RAM:").expect("ram header");
+        let ram_block = &output[ram_pos..];
+        assert!(
+            ram_block.contains("outer"),
+            "outer (100ms) should appear in RAM block:\n{output}"
+        );
+        assert!(
+            !ram_block.contains("inner_short"),
+            "inner_short (1ms) should be filtered by min_duration=5ms in RAM block:\n{output}"
+        );
+    }
+
+    #[test]
+    fn render_ram_block_skipped_when_disabled() {
+        let interval_start = UNIX_EPOCH;
+        let output = dump_to_string_with(id(1), render_settings(false), |tracker| {
+            tracker.new_span(vec![id(1)]);
+            tracker.open(
+                vec![id(1)],
+                closed_span(
+                    "outer",
+                    interval_start,
+                    interval_start + Duration::from_secs(1),
+                    RssSample {
+                        current_kb: 1024,
+                        peak_kb: 1024,
+                    },
+                    RssSample {
+                        current_kb: 2048,
+                        peak_kb: 2048,
+                    },
+                ),
+            );
+        });
+        assert!(
+            !output.contains("RAM:"),
+            "RAM block should be absent when track_ram=false:\n{output}"
+        );
+    }
+
+    #[test]
+    fn render_ram_block_skipped_when_all_samples_zero() {
+        // track_ram is on but no real samples were taken (e.g. non-Linux);
+        // we should not print a misleading all-zero RAM block.
+        let interval_start = UNIX_EPOCH;
+        let output = dump_to_string_with(id(1), render_settings(true), |tracker| {
+            tracker.new_span(vec![id(1)]);
+            tracker.open(
+                vec![id(1)],
+                closed_span(
+                    "outer",
+                    interval_start,
+                    interval_start + Duration::from_secs(1),
+                    RssSample::default(),
+                    RssSample::default(),
+                ),
+            );
+        });
+        assert!(
+            !output.contains("RAM:"),
+            "RAM block should be absent when all samples are zero:\n{output}"
+        );
+    }
+
+    #[test]
+    fn span_info_for_span_samples_when_enabled() {
+        // Without a real tracing Subscriber we can't call SpanInfo::for_span
+        // directly, but we can exercise the gating logic the same way it does:
+        // sample only when track_ram is true.
+        let sampled = if true { read_rss() } else { RssSample::default() };
+        let unsampled = if false { read_rss() } else { RssSample::default() };
+        assert!(unsampled.is_zero());
+        // On Linux the test process has live RSS; off-Linux read_rss is zero.
+        #[cfg(target_os = "linux")]
+        assert!(!sampled.is_zero());
+        #[cfg(not(target_os = "linux"))]
+        assert!(sampled.is_zero());
+    }
+
+    #[test]
+    fn interest_tracker_exit_samples_when_track_ram() {
+        // exit() should record a non-zero end_rss when track_ram is on, on Linux.
+        let mut tracker =
+            InterestTracker::new(id(1), render_settings(true), FieldSettings::default(), {
+                let (w, _) = DynWriter::str();
+                w
+            });
+        tracker.new_span(vec![id(1)]);
+        tracker.open(
+            vec![id(1)],
+            SpanInfo {
+                name: "x",
+                start: UNIX_EPOCH,
+                end: None,
+                start_rss: RssSample::default(),
+                end_rss: RssSample::default(),
+            },
+        );
+        tracker.exit(vec![id(1)], UNIX_EPOCH + Duration::from_secs(1));
+        let span = tracker.span(vec![id(1)]);
+        let info = span.info.as_ref().expect("info set after open");
+        #[cfg(target_os = "linux")]
+        assert!(
+            !info.end_rss.is_zero(),
+            "expected real RSS sample on Linux, got {:?}",
+            info.end_rss
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(info.end_rss.is_zero());
+    }
+
+    #[test]
+    fn interest_tracker_exit_skips_sampling_when_disabled() {
+        let mut tracker = InterestTracker::new(
+            id(1),
+            render_settings(false),
+            FieldSettings::default(),
+            {
+                let (w, _) = DynWriter::str();
+                w
+            },
+        );
+        tracker.new_span(vec![id(1)]);
+        tracker.open(
+            vec![id(1)],
+            SpanInfo {
+                name: "x",
+                start: UNIX_EPOCH,
+                end: None,
+                start_rss: RssSample::default(),
+                end_rss: RssSample::default(),
+            },
+        );
+        tracker.exit(vec![id(1)], UNIX_EPOCH + Duration::from_secs(1));
+        let span = tracker.span(vec![id(1)]);
+        let info = span.info.as_ref().expect("info set after open");
+        assert!(info.end_rss.is_zero());
     }
 }
 

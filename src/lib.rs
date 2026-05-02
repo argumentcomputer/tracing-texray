@@ -89,6 +89,45 @@ pub fn examine(span: Span) -> Span {
     span
 }
 
+/// Examine the currently-entered span.
+///
+/// Equivalent to `examine(tracing::Span::current())`, but discoverable
+/// from inside `#[tracing::instrument]`-decorated functions where the
+/// span handle isn't directly available.
+///
+/// Because the span is already entered by the time this is called,
+/// texray's `on_enter` callback already fired without recording the span
+/// — so this also synthesizes the root span info (using `now()` as the
+/// start, which approximates the actual entry within call-site overhead).
+///
+/// If no span is currently entered (e.g. no subscriber installed), this is
+/// a no-op.
+///
+/// # Examples
+/// ```no_run
+/// use tracing_texray::TeXRayLayer;
+/// use tracing_subscriber::Registry;
+/// use tracing_subscriber::layer::SubscriberExt;
+/// let subscriber = Registry::default().with(TeXRayLayer::new());
+/// tracing::subscriber::set_global_default(subscriber).unwrap();
+///
+/// #[tracing::instrument(name = "load_data")]
+/// fn load_data() {
+///     tracing_texray::examine_current();
+///     // ...work...
+/// }
+/// ```
+pub fn examine_current() -> Span {
+    let span = Span::current();
+    let span = examine(span);
+    if let (Some(id), Some(meta)) = (span.id(), span.metadata()) {
+        GLOBAL_TEXRAY_LAYER
+            .tracker
+            .populate_examined_root(&id, meta.name());
+    }
+    span
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct Types {
     events: bool,
@@ -103,6 +142,7 @@ pub struct Settings {
     types: Types,
     field_filter: FieldFilter,
     default_output: DynWriter,
+    track_ram: bool,
 }
 
 impl Settings {
@@ -112,6 +152,7 @@ impl Settings {
                 width: self.width,
                 min_duration: self.min_duration,
                 types: self.types,
+                track_ram: self.track_ram,
             },
             fields: FieldSettings::new(self.field_filter),
             out: self.default_output,
@@ -169,12 +210,32 @@ impl Default for Settings {
             default_output: DynWriter {
                 inner: Arc::new(Mutex::new(stderr())),
             },
+            track_ram: false,
         }
     }
 }
 
+/// Probe terminal columns by trying stdout, stderr, then stdin in order.
+/// Caller pipelines (e.g. `lake exe …` redirecting stdout to a benchmark
+/// harness) leave stderr/stdin as the only fd connected to the actual
+/// terminal — querying only stdout would miss the real width and fall back
+/// to the default 120, which can wrap in narrow splits or be ignored
+/// (defaulting too wide on big terminals).
+fn detect_terminal_width() -> Option<usize> {
+    use terminal_size::terminal_size_of;
+    [
+        terminal_size_of(std::io::stdout()),
+        terminal_size_of(std::io::stderr()),
+        terminal_size_of(std::io::stdin()),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    .map(|(w, _)| usize::from(w.0))
+}
+
 impl Settings {
-    /// Load settings via term-size & defaults
+    /// Load settings via terminal-size detection & defaults
     ///
     /// By default:
     /// - All fields are printed
@@ -182,7 +243,7 @@ impl Settings {
     /// - Spans of any duration are printed
     pub fn auto() -> Self {
         let mut base = Settings::default();
-        if let Some((w, _h)) = term_size::dimensions() {
+        if let Some(w) = detect_terminal_width() {
             base.width = w;
         };
         base
@@ -234,6 +295,17 @@ impl Settings {
         self.min_duration = Some(duration);
         self
     }
+
+    /// Sample process RSS on span enter/exit and print a `RAM:` block below
+    /// the timeline. Each row shows the net RSS delta (`Δ`) for the span and
+    /// the high-water mark (`peak`) reached during it.
+    ///
+    /// Sampling reads `/proc/self/status` once per span enter and once per
+    /// exit (Linux only — zeros elsewhere).
+    pub fn track_ram(mut self) -> Self {
+        self.track_ram = true;
+        self
+    }
 }
 
 /// Tracing Layer to display a summary of spans.
@@ -271,6 +343,7 @@ struct RenderSettings {
     width: usize,
     min_duration: Option<Duration>,
     types: Types,
+    track_ram: bool,
 }
 
 impl Default for RenderSettings {
@@ -282,6 +355,7 @@ impl Default for RenderSettings {
                 events: false,
                 spans: true,
             },
+            track_ram: false,
         }
     }
 }
@@ -397,6 +471,14 @@ impl TeXRayLayer {
         self
     }
 
+    /// Enable RSS sampling. Each examined span will record current and peak
+    /// resident-set size on enter and exit, and a `RAM:` block will be
+    /// printed below the timeline showing per-span deltas and peaks.
+    pub fn track_ram(mut self) -> Self {
+        self.settings_mut().track_ram = true;
+        self
+    }
+
     /// Update the settings of this [`TexRayLayer`]
     pub fn update_settings(mut self, f: impl FnOnce(&mut Settings) -> &mut Settings) -> Self {
         // TODO: assert!(self.tracked_spans_v2.is_empty());
@@ -501,7 +583,8 @@ where
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
         check_initialized!(self);
         self.for_tracker(id, &ctx, |tracker, path| {
-            tracker.open(path, SpanInfo::for_span(id, &ctx));
+            let info = SpanInfo::for_span(id, &ctx, tracker.track_ram());
+            tracker.open(path, info);
             Action::DoNothing
         });
     }

@@ -87,6 +87,22 @@ fn some_other_function(id: usize) {
 }
 ```
 
+For functions decorated with `#[tracing::instrument]`, the span handle isn't
+directly available — call `examine_current()` from inside the function body
+instead:
+
+```rust
+use tracing::info_span;
+
+#[tracing::instrument(name = "do_a_thing", skip_all)]
+fn somewhere_deep_in_my_program() {
+    tracing_texray::examine_current();
+    for id in 0..5 {
+        info_span!("inner_task", id = %id).in_scope(|| tracing::info!("buzz"));
+    }
+}
+```
+
 When the `do_a_thing` span exits, output like the following will be printed: 
 ```text
 do_a_thing           509μs ├───────────────────────────────────────────────────┤
@@ -101,3 +117,34 @@ do_a_thing           509μs ├────────────────�
   inner_task{id: 4}   35μs                                                 ├──┤
    >buzz                                                                   ┼
 ```
+
+## RAM tracking
+
+`TeXRayLayer::track_ram()` enables per-span RSS sampling. Each examined span
+records the process's resident-set size on entry and exit, plus the
+high-water mark (`VmHWM`). Below the timeline, a `RAM:` block shows the
+trajectory and peak per span:
+
+```rust
+use tracing_texray::TeXRayLayer;
+
+let layer = TeXRayLayer::new().track_ram();
+# drop(layer);
+```
+
+```text
+prove                          1.4s ├──────────────────────────────────────┤
+  stage1_commit                30ms ├─┤
+  ...
+
+RAM:
+  prove           RSS 320.00 MiB → 338.00 MiB (Δ +18.00 MiB)   peak 471.96 MiB
+    stage1_commit RSS 320.00 MiB → 368.00 MiB (Δ +48.00 MiB)   peak 371.90 MiB
+    ...
+```
+
+The `RSS start → end` trajectory plus the `peak` make transient allocations
+visible: a span ending well below its peak (e.g. `prove` above ending at
+338 MiB but peaking at 472) freed memory before exiting. RSS sampling reads
+`/proc/self/status`, so it's Linux-only — non-Linux samples report zero and
+the `RAM:` block is suppressed.

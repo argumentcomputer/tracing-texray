@@ -2,17 +2,17 @@
 name = "tracing-texray"
 description = "Tracing layer to view a plaintext timeline of spans and events"
 version = "0.2.0"
-edition = "2018"
+edition = "2024"
 authors = ["russell.r.cohen@gmail.com"]
 license = "MIT"
 repository = "https://github.com/rcoh/tracing-texray"
-rust-version = "1.54.0"
+rust-version = "1.85.0"
 
 [dependencies]
 tracing-subscriber = "0.3.5"
 tracing = { version  = "0.1.29", default-features = false }
 lazy_static = "1.4.0"
-term_size = "0.3.2"
+terminal_size = "0.4"
 parking_lot = "0.12.1"
 
 [dev-dependencies]
@@ -24,6 +24,9 @@ loom = "0.5"
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.5"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [profile.release]
 debug = 1
