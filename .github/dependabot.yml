@@ -1,0 +1,34 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    pull-request-branch-name:
+      separator: "-"
+    schedule:
+      interval: weekly
+    # Create separate pull requests for major vs minor/patch version updates, as major bumps will likely introduce breaking changes
+    groups:
+      rust-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      rust-major:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
+    allow:
+      # Update both direct and indirect dependencies
+      - dependency-type: "all"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
