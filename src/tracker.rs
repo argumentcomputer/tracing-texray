@@ -57,7 +57,11 @@ impl SpanInfo {
                 .unwrap_or("could-not-find-span"),
             start: SystemTime::now(),
             end: None,
-            start_rss: if track_ram { read_rss() } else { RssSample::default() },
+            start_rss: if track_ram {
+                read_rss()
+            } else {
+                RssSample::default()
+            },
             end_rss: RssSample::default(),
         }
     }
@@ -172,6 +176,40 @@ fn format_signed_kb(start_kb: u64, end_kb: u64) -> String {
     format!("{sign}{}", format_bytes(mag))
 }
 
+/// Streaming-mode duration formatter: `1.23m`, `4.56s`, `789.01ms`, etc.
+/// More precise than the timeline's `pretty_duration` (which truncates to
+/// integers of the largest unit).
+fn format_streaming_duration(d: Duration) -> String {
+    let nanos = d.as_nanos();
+    if nanos < 1_000 {
+        format!("{nanos}ns")
+    } else if nanos < 1_000_000 {
+        format!("{:.2}μs", nanos as f64 / 1_000.0)
+    } else if nanos < 1_000_000_000 {
+        format!("{:.2}ms", nanos as f64 / 1_000_000.0)
+    } else if nanos < 60_000_000_000 {
+        format!("{:.2}s", nanos as f64 / 1_000_000_000.0)
+    } else if nanos < 3_600_000_000_000 {
+        let secs = nanos as f64 / 1_000_000_000.0;
+        format!("{:.2}m", secs / 60.0)
+    } else {
+        let secs = nanos as f64 / 1_000_000_000.0;
+        format!("{:.2}h", secs / 3_600.0)
+    }
+}
+
+/// `  ── RAM Δ +X peak Y` suffix, or empty when no RAM data was captured.
+fn format_streaming_rss(start: RssSample, end: RssSample) -> String {
+    if start.is_zero() && end.is_zero() {
+        return String::new();
+    }
+    format!(
+        "  ── RAM Δ {} peak {}",
+        format_signed_kb(start.current_kb, end.current_kb),
+        format_bytes(end.peak_kb),
+    )
+}
+
 impl SpanInfo {
     fn full_name(&self, tracker: &SpanTracker, settings: &FieldSettings) -> String {
         let mut id = self.name.to_string();
@@ -284,9 +322,9 @@ impl SpanTracker {
     }
 
     pub(crate) fn open(&mut self, span_info: SpanInfo) {
-        match self.info {
-            None => self.info = Some(span_info),
-            Some(_) => {} // already open, don't update
+        // Only record the first open; already-open spans aren't updated.
+        if self.info.is_none() {
+            self.info = Some(span_info);
         }
     }
 
@@ -302,6 +340,17 @@ impl SpanTracker {
 
     fn span_info(&self) -> impl Iterator<Item = &SpanInfo> {
         self.info.iter()
+    }
+
+    /// One-line summary for streaming mode: `[texray] <name>: <dur>  ── RAM Δ +X peak Y`.
+    /// Returns `None` if the span has no recorded info or hasn't ended.
+    pub(crate) fn streaming_line(&self) -> Option<String> {
+        let info = self.info.as_ref()?;
+        let end = info.end?;
+        let duration = end.duration_since(info.start).ok()?;
+        let dur_fmt = format_streaming_duration(duration);
+        let rss_suffix = format_streaming_rss(info.start_rss, info.end_rss);
+        Some(format!("[texray] {}: {dur_fmt}{rss_suffix}", info.name))
     }
 
     fn max_key_width(&self, depth: usize) -> usize {
@@ -392,7 +441,19 @@ impl InterestTracker {
         } else {
             RssSample::default()
         };
-        self.span(path).exit(timestamp, end_rss);
+        let streaming = self.render_settings.streaming;
+        let line = {
+            let span = self.span(path);
+            span.exit(timestamp, end_rss);
+            if streaming {
+                span.streaming_line()
+            } else {
+                None
+            }
+        };
+        if let Some(line) = line {
+            let _ = writeln!(self.out.inner.lock(), "{line}");
+        }
     }
 
     pub(crate) fn track_ram(&self) -> bool {
@@ -707,6 +768,7 @@ impl Default for FieldSettings {
 
 #[cfg(test)]
 mod test {
+    use super::{format_streaming_duration, format_streaming_rss};
     use crate::{DynWriter, RenderSettings, Settings};
     use std::io::{BufWriter, Write};
 
@@ -719,8 +781,8 @@ mod test {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::tracker::{
-        format_bytes, format_signed_kb, read_rss, width, FieldSettings, InterestTracker,
-        RssSample, SpanInfo, TrackedMetadata,
+        FieldSettings, InterestTracker, RssSample, SpanInfo, TrackedMetadata, format_bytes,
+        format_signed_kb, read_rss, width,
     };
     use tracing::Id;
 
@@ -735,6 +797,7 @@ mod test {
             min_duration: settings.min_duration,
             types: settings.types,
             track_ram,
+            streaming: false,
         }
     }
 
@@ -857,18 +920,72 @@ test       10s  ├────────────────────�
     }
 
     #[test]
+    fn format_streaming_duration_units() {
+        use std::time::Duration;
+        assert_eq!(
+            format_streaming_duration(Duration::from_nanos(500)),
+            "500ns"
+        );
+        assert_eq!(
+            format_streaming_duration(Duration::from_nanos(1_500)),
+            "1.50μs"
+        );
+        assert_eq!(
+            format_streaming_duration(Duration::from_micros(1_500)),
+            "1.50ms"
+        );
+        assert_eq!(
+            format_streaming_duration(Duration::from_millis(1_500)),
+            "1.50s"
+        );
+        assert_eq!(format_streaming_duration(Duration::from_secs(90)), "1.50m");
+        assert_eq!(
+            format_streaming_duration(Duration::from_secs(5_400)),
+            "1.50h"
+        );
+    }
+
+    #[test]
+    fn format_streaming_rss_empty_when_zero() {
+        assert_eq!(
+            format_streaming_rss(RssSample::default(), RssSample::default()),
+            ""
+        );
+    }
+
+    #[test]
+    fn format_streaming_rss_renders_delta_and_peak() {
+        let start = RssSample {
+            current_kb: 1024,
+            peak_kb: 1024,
+        };
+        let end = RssSample {
+            current_kb: 3072,
+            peak_kb: 4096,
+        };
+        assert_eq!(
+            format_streaming_rss(start, end),
+            "  ── RAM Δ +2.00 MiB peak 4.00 MiB"
+        );
+    }
+
+    #[test]
     fn rss_sample_is_zero() {
         assert!(RssSample::default().is_zero());
-        assert!(!RssSample {
-            current_kb: 1,
-            peak_kb: 0
-        }
-        .is_zero());
-        assert!(!RssSample {
-            current_kb: 0,
-            peak_kb: 1
-        }
-        .is_zero());
+        assert!(
+            !RssSample {
+                current_kb: 1,
+                peak_kb: 0
+            }
+            .is_zero()
+        );
+        assert!(
+            !RssSample {
+                current_kb: 0,
+                peak_kb: 1
+            }
+            .is_zero()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1098,8 +1215,16 @@ test       10s  ├────────────────────�
         // Without a real tracing Subscriber we can't call SpanInfo::for_span
         // directly, but we can exercise the gating logic the same way it does:
         // sample only when track_ram is true.
-        let sampled = if true { read_rss() } else { RssSample::default() };
-        let unsampled = if false { read_rss() } else { RssSample::default() };
+        let sampled = if true {
+            read_rss()
+        } else {
+            RssSample::default()
+        };
+        let unsampled = if false {
+            read_rss()
+        } else {
+            RssSample::default()
+        };
         assert!(unsampled.is_zero());
         // On Linux the test process has live RSS; off-Linux read_rss is zero.
         #[cfg(target_os = "linux")]
@@ -1142,15 +1267,11 @@ test       10s  ├────────────────────�
 
     #[test]
     fn interest_tracker_exit_skips_sampling_when_disabled() {
-        let mut tracker = InterestTracker::new(
-            id(1),
-            render_settings(false),
-            FieldSettings::default(),
-            {
+        let mut tracker =
+            InterestTracker::new(id(1), render_settings(false), FieldSettings::default(), {
                 let (w, _) = DynWriter::str();
                 w
-            },
-        );
+            });
         tracker.new_span(vec![id(1)]);
         tracker.open(
             vec![id(1)],
