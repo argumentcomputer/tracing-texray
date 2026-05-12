@@ -16,10 +16,10 @@ use std::borrow::Cow;
 use parking_lot::lock_api::{MutexGuard, RawMutex};
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
-use std::io::{stderr, Write};
+use std::io::{Write, stderr};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use tracing::span::{Attributes, Record};
@@ -33,9 +33,8 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry};
 use tracker::{EventInfo, FieldSettings, InterestTracker, RootTracker, SpanInfo, TrackedMetadata};
 
-lazy_static::lazy_static! {
-    static ref GLOBAL_TEXRAY_LAYER: TeXRayLayer = TeXRayLayer::uninitialized();
-}
+static GLOBAL_TEXRAY_LAYER: std::sync::LazyLock<TeXRayLayer> =
+    std::sync::LazyLock::new(TeXRayLayer::uninitialized);
 
 macro_rules! check_initialized {
     ($self: expr) => {
@@ -143,6 +142,7 @@ pub struct Settings {
     field_filter: FieldFilter,
     default_output: DynWriter,
     track_ram: bool,
+    streaming: bool,
 }
 
 impl Settings {
@@ -153,6 +153,7 @@ impl Settings {
                 min_duration: self.min_duration,
                 types: self.types,
                 track_ram: self.track_ram,
+                streaming: self.streaming,
             },
             fields: FieldSettings::new(self.field_filter),
             out: self.default_output,
@@ -211,6 +212,7 @@ impl Default for Settings {
                 inner: Arc::new(Mutex::new(stderr())),
             },
             track_ram: false,
+            streaming: false,
         }
     }
 }
@@ -306,6 +308,17 @@ impl Settings {
         self.track_ram = true;
         self
     }
+
+    /// Emit a one-line summary `[texray] <name>: <duration>  ── RAM Δ +X peak Y`
+    /// to the layer's writer as each tracked span closes, in addition to the
+    /// texray graph printed at the end of the [`examine`]'d root span.
+    ///
+    /// The RAM suffix is only present when [`track_ram`] is also enabled and
+    /// the sample is non-zero (Linux only).
+    pub fn streaming(mut self) -> Self {
+        self.streaming = true;
+        self
+    }
 }
 
 /// Tracing Layer to display a summary of spans.
@@ -344,6 +357,7 @@ struct RenderSettings {
     min_duration: Option<Duration>,
     types: Types,
     track_ram: bool,
+    streaming: bool,
 }
 
 impl Default for RenderSettings {
@@ -356,6 +370,7 @@ impl Default for RenderSettings {
                 spans: true,
             },
             track_ram: false,
+            streaming: false,
         }
     }
 }
@@ -476,6 +491,14 @@ impl TeXRayLayer {
     /// printed below the timeline showing per-span deltas and peaks.
     pub fn track_ram(mut self) -> Self {
         self.settings_mut().track_ram = true;
+        self
+    }
+
+    /// Stream a one-line `[texray] <name>: <duration>  ── RAM Δ +X peak Y`
+    /// summary to the layer's writer as each tracked span closes. The full
+    /// texray graph still prints when the examined root span exits.
+    pub fn streaming(mut self) -> Self {
+        self.settings_mut().streaming = true;
         self
     }
 

@@ -47,24 +47,23 @@ as configured).
 use std::time::Duration;
 use tracing_texray::TeXRayLayer;
 use tracing_subscriber::{Registry, EnvFilter, layer::SubscriberExt};
-fn main() {
-    // Option A: Exclusively using tracing_texray:
-    tracing_texray::init();
-    
-    // Option B: install the layer in combination with other layers, eg. tracing_subscriber::fmt:
-    let subscriber = Registry::default()
-        .with(EnvFilter::try_from_default_env().expect("invalid env filter"))
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            TeXRayLayer::new()
-                // by default, all metadata fields will be printed. If this is too noisy,
-                // fitler only the fields you care about
-                .only_show_fields(&["name", "operation", "service"])
-                // only print spans longer than a certain duration
-                .min_duration(Duration::from_millis(100)),
-        );
-    tracing::subscriber::set_global_default(subscriber).unwrap();
-}
+
+// Option A: Exclusively using tracing_texray:
+tracing_texray::init();
+
+// Option B: install the layer in combination with other layers, eg. tracing_subscriber::fmt:
+let subscriber = Registry::default()
+    .with(EnvFilter::try_from_default_env().expect("invalid env filter"))
+    .with(tracing_subscriber::fmt::layer())
+    .with(
+        TeXRayLayer::new()
+            // by default, all metadata fields will be printed. If this is too noisy,
+            // filter only the fields you care about
+            .only_show_fields(&["name", "operation", "service"])
+            // only print spans longer than a certain duration
+            .min_duration(Duration::from_millis(100)),
+    );
+tracing::subscriber::set_global_default(subscriber).unwrap();
 ```
 
 **Next**, wrap any spans you want to track with `examine`:

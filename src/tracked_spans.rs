@@ -133,7 +133,7 @@ impl TrackedSpans {
 
 #[cfg(test)]
 mod test {
-    use crate::tracked_spans::{InsertResult, TrackedSpans, TOMBSTONE};
+    use crate::tracked_spans::{InsertResult, TOMBSTONE, TrackedSpans};
     use std::collections::HashSet;
     use std::num::NonZeroU64;
 

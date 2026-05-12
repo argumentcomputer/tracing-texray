@@ -6,7 +6,7 @@ use tracing::info_span;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_texray::TeXRayLayer;
 
-#[tracing::instrument(name = "instrumented_outer", skip_all)]
+#[tracing::instrument(name = "outer", skip_all)]
 fn instrumented_work() {
     tracing_texray::examine_current();
     info_span!("inner").in_scope(|| {
@@ -15,10 +15,11 @@ fn instrumented_work() {
 }
 
 #[test]
-fn examine_current_dumps_instrumented_span() {
+fn streaming_emits_line_per_span_close() {
     let writer = CaptureWriter::new();
     let layer = TeXRayLayer::new()
         .width(80)
+        .streaming()
         .update_settings(|s| s.writer(writer.clone()));
     let registry = tracing_subscriber::registry().with(layer);
     tracing::subscriber::set_global_default(registry).expect("failed to install subscriber");
@@ -26,13 +27,26 @@ fn examine_current_dumps_instrumented_span() {
     instrumented_work();
 
     let output = writer.to_string();
+    // Streaming lines should appear for each tracked span as it closes.
     assert!(
-        output.contains("instrumented_outer"),
-        "expected outer span name in dump:\n{output}"
+        output.contains("[texray] outer:"),
+        "expected outer span streaming line:\n{output}"
     );
     assert!(
-        output.contains("inner"),
-        "expected nested span in dump:\n{output}"
+        output.contains("[texray] inner:"),
+        "expected inner span streaming line:\n{output}"
+    );
+    // Streaming lines should fire *before* the texray graph prints — the
+    // inner span closes first, then outer (which also triggers the print).
+    let inner_pos = output
+        .find("[texray] inner:")
+        .expect("inner streaming line missing");
+    let outer_pos = output
+        .find("[texray] outer:")
+        .expect("outer streaming line missing");
+    assert!(
+        inner_pos < outer_pos,
+        "expected inner streaming line before outer:\n{output}"
     );
 }
 

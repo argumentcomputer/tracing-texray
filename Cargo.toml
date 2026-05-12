@@ -9,21 +9,20 @@ repository = "https://github.com/rcoh/tracing-texray"
 rust-version = "1.85.0"
 
 [dependencies]
-tracing-subscriber = "0.3.5"
-tracing = { version  = "0.1.29", default-features = false }
-lazy_static = "1.4.0"
-terminal_size = "0.4"
-parking_lot = "0.12.1"
+tracing-subscriber = "0.3.23"
+tracing = "0.1.44"
+terminal_size = "0.4.4"
+parking_lot = "0.12.5"
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3.5", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"]}
-proptest = "1.1.0"
-env_logger = "0.10.0"
-loom = "0.5"
+proptest = "1.11.0"
+env_logger = "0.11.10"
+loom = "0.7.2"
 
 [target.'cfg(loom)'.dependencies]
-loom = "0.5"
+loom = "0.7.2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

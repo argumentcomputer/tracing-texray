@@ -69,7 +69,7 @@ fn some_other_function(id: usize) {
 mod test_util {
     use parking_lot::Mutex;
     use std::fmt::{Display, Formatter};
-    use std::io::{stdout, Write};
+    use std::io::{Write, stdout};
     use std::sync::Arc;
 
     #[derive(Clone)]
