@@ -298,14 +298,20 @@ impl Settings {
         self
     }
 
-    /// Sample process RSS on span enter/exit and print a `RAM:` block below
-    /// the timeline. Each row shows the net RSS delta (`Δ`) for the span and
-    /// the high-water mark (`peak`) reached during it.
+    /// Sample process RSS on span enter/exit so each streaming line carries a
+    /// `── RAM Δ +X peak Y` suffix. Implies [`streaming`], which is the only
+    /// output channel for the RAM data.
     ///
     /// Sampling reads `/proc/self/status` once per span enter and once per
     /// exit (Linux only — zeros elsewhere).
     pub fn track_ram(mut self) -> Self {
+        self.set_track_ram();
+        self
+    }
+
+    fn set_track_ram(&mut self) -> &mut Self {
         self.track_ram = true;
+        self.streaming = true;
         self
     }
 
@@ -486,11 +492,12 @@ impl TeXRayLayer {
         self
     }
 
-    /// Enable RSS sampling. Each examined span will record current and peak
-    /// resident-set size on enter and exit, and a `RAM:` block will be
-    /// printed below the timeline showing per-span deltas and peaks.
+    /// Enable RSS sampling. Each examined span records current and peak
+    /// resident-set size on enter and exit, and each streaming line carries
+    /// a `── RAM Δ +X peak Y` suffix. Implies [`streaming`], which is the
+    /// only output channel for the RAM data.
     pub fn track_ram(mut self) -> Self {
-        self.settings_mut().track_ram = true;
+        self.settings_mut().set_track_ram();
         self
     }
 
@@ -624,5 +631,30 @@ where
         }) {
             let _ = removed_tracker.dump();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn track_ram_implies_streaming() {
+        let s = Settings::default().track_ram();
+        assert!(s.track_ram, "track_ram flag should be set");
+        assert!(
+            s.streaming,
+            "track_ram() should also enable streaming — it's the only output channel for RAM data"
+        );
+    }
+
+    #[test]
+    fn streaming_alone_leaves_track_ram_off() {
+        let s = Settings::default().streaming();
+        assert!(s.streaming);
+        assert!(
+            !s.track_ram,
+            "streaming() should not enable track_ram — timing-only output is a valid mode"
+        );
     }
 }

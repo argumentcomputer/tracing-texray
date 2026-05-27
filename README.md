@@ -117,12 +117,27 @@ do_a_thing           509μs ├────────────────�
    >buzz                                                                   ┼
 ```
 
-## RAM tracking
+## Streaming per-span stats
 
-`TeXRayLayer::track_ram()` enables per-span RSS sampling. Each examined span
-records the process's resident-set size on entry and exit, plus the
-high-water mark (`VmHWM`). Below the timeline, a `RAM:` block shows the
-trajectory and peak per span:
+`TeXRayLayer::streaming()` emits a one-line summary as each tracked span
+closes, in addition to the timeline that prints when the `examine`'d root
+exits:
+
+```rust
+use tracing_texray::TeXRayLayer;
+
+let layer = TeXRayLayer::new().streaming();
+# drop(layer);
+```
+
+```text
+[texray] stage1_commit: 30.12ms
+[texray] prove: 1.40s
+```
+
+To include RSS delta and peak alongside the duration, call `track_ram()` —
+it enables RAM sampling *and* turns on streaming (streaming is the only
+output channel for the RAM data, so `track_ram()` implies it):
 
 ```rust
 use tracing_texray::TeXRayLayer;
@@ -132,18 +147,12 @@ let layer = TeXRayLayer::new().track_ram();
 ```
 
 ```text
-prove                          1.4s ├──────────────────────────────────────┤
-  stage1_commit                30ms ├─┤
-  ...
-
-RAM:
-  prove           RSS 320.00 MiB → 338.00 MiB (Δ +18.00 MiB)   peak 471.96 MiB
-    stage1_commit RSS 320.00 MiB → 368.00 MiB (Δ +48.00 MiB)   peak 371.90 MiB
-    ...
+[texray] stage1_commit: 30.12ms  ── RAM Δ +48.00 MiB peak 371.90 MiB
+[texray] prove: 1.40s  ── RAM Δ +18.00 MiB peak 471.96 MiB
 ```
 
-The `RSS start → end` trajectory plus the `peak` make transient allocations
-visible: a span ending well below its peak (e.g. `prove` above ending at
-338 MiB but peaking at 472) freed memory before exiting. RSS sampling reads
+The `Δ` is the net RSS change between entry and exit; `peak` is `VmHWM` at
+exit. A span ending well below its peak (e.g. `prove` above with Δ +18 MiB
+but peak 472 MiB) freed memory before returning. RSS sampling reads
 `/proc/self/status`, so it's Linux-only — non-Linux samples report zero and
-the `RAM:` block is suppressed.
+the RAM suffix is suppressed.

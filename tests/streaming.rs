@@ -20,6 +20,7 @@ fn streaming_emits_line_per_span_close() {
     let layer = TeXRayLayer::new()
         .width(80)
         .streaming()
+        .track_ram()
         .update_settings(|s| s.writer(writer.clone()));
     let registry = tracing_subscriber::registry().with(layer);
     tracing::subscriber::set_global_default(registry).expect("failed to install subscriber");
@@ -47,6 +48,14 @@ fn streaming_emits_line_per_span_close() {
     assert!(
         inner_pos < outer_pos,
         "expected inner streaming line before outer:\n{output}"
+    );
+    // track_ram() is enabled; on Linux each streaming line should carry a
+    // `── RAM Δ ... peak ...` suffix from real RSS sampling. Off-Linux the
+    // sample is zero and the suffix is suppressed.
+    #[cfg(target_os = "linux")]
+    assert!(
+        output.contains("── RAM Δ"),
+        "expected RAM suffix on streaming lines with track_ram on Linux:\n{output}"
     );
 }
 
