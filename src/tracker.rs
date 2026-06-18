@@ -210,6 +210,20 @@ fn format_streaming_rss(start: RssSample, end: RssSample) -> String {
     )
 }
 
+/// Machine-readable companion to the streaming RSS suffix: a single raw byte
+/// count (peak RSS), with no unit conversion, for programmatic consumers that
+/// shouldn't have to parse the human-formatted timeline or summary graph.
+/// `None` when no RSS was sampled (peak 0) — non-Linux, or RAM tracking off.
+fn format_peak_rss_line(name: &str, peak_kb: u64) -> Option<String> {
+    if peak_kb == 0 {
+        return None;
+    }
+    Some(format!(
+        "[texray] {name} peak-rss-bytes={}",
+        peak_kb.saturating_mul(1024)
+    ))
+}
+
 impl SpanInfo {
     fn full_name(&self, tracker: &SpanTracker, settings: &FieldSettings) -> String {
         let mut id = self.name.to_string();
@@ -353,6 +367,16 @@ impl SpanTracker {
         Some(format!("[texray] {}: {dur_fmt}{rss_suffix}", info.name))
     }
 
+    /// Machine-readable companion to [`streaming_line`]: `[texray] <name>
+    /// peak-rss-bytes=<N>` (raw bytes). Lets streaming consumers read the peak
+    /// RSS as a single integer instead of parsing the human-formatted suffix.
+    /// `None` when the span hasn't ended or no RSS was sampled.
+    pub(crate) fn streaming_rss_line(&self) -> Option<String> {
+        let info = self.info.as_ref()?;
+        info.end?;
+        format_peak_rss_line(&info.name.to_string(), info.end_rss.peak_kb)
+    }
+
     fn max_key_width(&self, depth: usize) -> usize {
         let longest_self = self
             .info
@@ -442,17 +466,21 @@ impl InterestTracker {
             RssSample::default()
         };
         let streaming = self.render_settings.streaming;
-        let line = {
+        let (line, rss_line) = {
             let span = self.span(path);
             span.exit(timestamp, end_rss);
             if streaming {
-                span.streaming_line()
+                (span.streaming_line(), span.streaming_rss_line())
             } else {
-                None
+                (None, None)
             }
         };
+        let mut out = self.out.inner.lock();
         if let Some(line) = line {
-            let _ = writeln!(self.out.inner.lock(), "{line}");
+            let _ = writeln!(out, "{line}");
+        }
+        if let Some(rss_line) = rss_line {
+            let _ = writeln!(out, "{rss_line}");
         }
     }
 
@@ -768,7 +796,7 @@ impl Default for FieldSettings {
 
 #[cfg(test)]
 mod test {
-    use super::{format_streaming_duration, format_streaming_rss};
+    use super::{format_peak_rss_line, format_streaming_duration, format_streaming_rss};
     use crate::{DynWriter, RenderSettings, Settings};
     use std::io::{BufWriter, Write};
 
@@ -781,8 +809,8 @@ mod test {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::tracker::{
-        FieldSettings, InterestTracker, RssSample, SpanInfo, TrackedMetadata, format_bytes,
-        format_signed_kb, read_rss, width,
+        format_bytes, format_signed_kb, read_rss, width, FieldSettings, InterestTracker, RssSample,
+        SpanInfo, TrackedMetadata,
     };
     use tracing::Id;
 
@@ -970,22 +998,29 @@ test       10s  ├────────────────────�
     }
 
     #[test]
+    fn format_peak_rss_line_raw_bytes() {
+        // 4096 KiB peak -> 4194304 bytes, raw integer, no unit conversion.
+        assert_eq!(
+            format_peak_rss_line("aiur/prove", 4096),
+            Some("[texray] aiur/prove peak-rss-bytes=4194304".to_string())
+        );
+        // Zero peak (non-Linux / RAM tracking off) emits nothing.
+        assert_eq!(format_peak_rss_line("aiur/prove", 0), None);
+    }
+
+    #[test]
     fn rss_sample_is_zero() {
         assert!(RssSample::default().is_zero());
-        assert!(
-            !RssSample {
-                current_kb: 1,
-                peak_kb: 0
-            }
-            .is_zero()
-        );
-        assert!(
-            !RssSample {
-                current_kb: 0,
-                peak_kb: 1
-            }
-            .is_zero()
-        );
+        assert!(!RssSample {
+            current_kb: 1,
+            peak_kb: 0
+        }
+        .is_zero());
+        assert!(!RssSample {
+            current_kb: 0,
+            peak_kb: 1
+        }
+        .is_zero());
     }
 
     #[cfg(target_os = "linux")]
