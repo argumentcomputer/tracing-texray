@@ -16,10 +16,10 @@ use std::borrow::Cow;
 use parking_lot::lock_api::{MutexGuard, RawMutex};
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
-use std::io::{Write, stderr};
+use std::io::{stderr, Write};
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tracing::span::{Attributes, Record};
@@ -298,9 +298,9 @@ impl Settings {
         self
     }
 
-    /// Sample process RSS on span enter/exit and print a `RAM:` block below
-    /// the timeline. Each row shows the net RSS delta (`Δ`) for the span and
-    /// the high-water mark (`peak`) reached during it.
+    /// Sample process RSS on span enter/exit. With [`streaming`](Self::streaming)
+    /// enabled, each span's close line carries its RSS delta (`Δ`) and high-water
+    /// mark (`peak`), plus a machine-readable `peak-rss-bytes=<N>` companion line.
     ///
     /// Sampling reads `/proc/self/status` once per span enter and once per
     /// exit (Linux only — zeros elsewhere).
@@ -486,9 +486,10 @@ impl TeXRayLayer {
         self
     }
 
-    /// Enable RSS sampling. Each examined span will record current and peak
-    /// resident-set size on enter and exit, and a `RAM:` block will be
-    /// printed below the timeline showing per-span deltas and peaks.
+    /// Enable RSS sampling. Each examined span records current and peak
+    /// resident-set size on enter/exit; with [`streaming`](Self::streaming)
+    /// enabled, each span's close line carries the RSS delta and peak plus a
+    /// machine-readable `peak-rss-bytes=<N>` companion line.
     pub fn track_ram(mut self) -> Self {
         self.settings_mut().track_ram = true;
         self
