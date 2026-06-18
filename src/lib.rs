@@ -298,9 +298,11 @@ impl Settings {
         self
     }
 
-    /// Sample process RSS on span enter/exit. With [`streaming`](Self::streaming)
-    /// enabled, each span's close line carries its RSS delta (`Δ`) and high-water
-    /// mark (`peak`), plus a machine-readable `peak-rss-bytes=<N>` companion line.
+    /// Sample process RSS on span enter/exit, surfaced on each span's
+    /// [`streaming`](Self::streaming) close line as the RSS delta (`Δ`),
+    /// high-water mark (`peak`), and a machine-readable `peak-rss-bytes=<N>`
+    /// companion. Requires `streaming`: the close lines are the only consumer
+    /// of the samples, so with streaming off no RSS is sampled.
     ///
     /// Sampling reads `/proc/self/status` once per span enter and once per
     /// exit (Linux only — zeros elsewhere).
@@ -486,10 +488,11 @@ impl TeXRayLayer {
         self
     }
 
-    /// Enable RSS sampling. Each examined span records current and peak
-    /// resident-set size on enter/exit; with [`streaming`](Self::streaming)
-    /// enabled, each span's close line carries the RSS delta and peak plus a
-    /// machine-readable `peak-rss-bytes=<N>` companion line.
+    /// Sample process RSS on span enter/exit. Takes effect only with
+    /// [`streaming`](Self::streaming), which surfaces each span's RSS delta and
+    /// peak plus a machine-readable `peak-rss-bytes=<N>` companion on its close
+    /// line; the close lines are the only consumer, so with streaming off no
+    /// RSS is sampled.
     pub fn track_ram(mut self) -> Self {
         self.settings_mut().track_ram = true;
         self
@@ -607,7 +610,7 @@ where
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
         check_initialized!(self);
         self.for_tracker(id, &ctx, |tracker, path| {
-            let info = SpanInfo::for_span(id, &ctx, tracker.track_ram());
+            let info = SpanInfo::for_span(id, &ctx, tracker.sample_rss());
             tracker.open(path, info);
             Action::DoNothing
         });

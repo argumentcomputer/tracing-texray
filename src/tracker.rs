@@ -46,7 +46,7 @@ impl EventInfo {
 }
 
 impl SpanInfo {
-    pub(crate) fn for_span<S>(span: &Id, ctx: &Context<'_, S>, track_ram: bool) -> Self
+    pub(crate) fn for_span<S>(span: &Id, ctx: &Context<'_, S>, sample_rss: bool) -> Self
     where
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
@@ -57,7 +57,7 @@ impl SpanInfo {
                 .unwrap_or("could-not-find-span"),
             start: SystemTime::now(),
             end: None,
-            start_rss: if track_ram {
+            start_rss: if sample_rss {
                 read_rss()
             } else {
                 RssSample::default()
@@ -460,7 +460,7 @@ impl InterestTracker {
     }
 
     pub(crate) fn exit(&mut self, path: Vec<Id>, timestamp: SystemTime) {
-        let end_rss = if self.render_settings.track_ram {
+        let end_rss = if self.sample_rss() {
             read_rss()
         } else {
             RssSample::default()
@@ -484,8 +484,11 @@ impl InterestTracker {
         }
     }
 
-    pub(crate) fn track_ram(&self) -> bool {
-        self.render_settings.track_ram
+    /// Whether to sample RSS: only when RAM tracking and streaming are both on.
+    /// The streaming close lines are the only consumer of RSS samples, so with
+    /// streaming off the per-span `/proc` reads would be wasted.
+    pub(crate) fn sample_rss(&self) -> bool {
+        self.render_settings.track_ram && self.render_settings.streaming
     }
 
     fn spans(&self) -> impl Iterator<Item = &SpanInfo> {
@@ -640,7 +643,7 @@ impl RootTracker {
         let Some(interest_tracker) = span_guard.get_mut(id) else {
             return;
         };
-        let track_ram = interest_tracker.render_settings.track_ram;
+        let sample_rss = interest_tracker.sample_rss();
         let field_settings = interest_tracker.field_settings.clone();
         let key = vec![id.clone()];
         let span_tracker = interest_tracker
@@ -648,7 +651,7 @@ impl RootTracker {
             .entry(key)
             .or_insert_with(|| SpanTracker::new(field_settings));
         if span_tracker.info.is_none() {
-            let start_rss = if track_ram {
+            let start_rss = if sample_rss {
                 read_rss()
             } else {
                 RssSample::default()
@@ -1023,13 +1026,21 @@ test       10s  ├────────────────────�
     }
 
     #[test]
-    fn interest_tracker_exit_samples_when_track_ram() {
-        // exit() should record a non-zero end_rss when track_ram is on, on Linux.
-        let mut tracker =
-            InterestTracker::new(id(1), render_settings(true), FieldSettings::default(), {
+    fn interest_tracker_exit_samples_when_tracking_and_streaming() {
+        // exit() records a non-zero end_rss only when track_ram and streaming
+        // are both on (RSS is consumed by the streaming lines); Linux only.
+        let mut tracker = InterestTracker::new(
+            id(1),
+            RenderSettings {
+                streaming: true,
+                ..render_settings(true)
+            },
+            FieldSettings::default(),
+            {
                 let (w, _) = DynWriter::str();
                 w
-            });
+            },
+        );
         tracker.new_span(vec![id(1)]);
         tracker.open(
             vec![id(1)],
@@ -1076,6 +1087,36 @@ test       10s  ├────────────────────�
         let span = tracker.span(vec![id(1)]);
         let info = span.info.as_ref().expect("info set after open");
         assert!(info.end_rss.is_zero());
+    }
+
+    #[test]
+    fn interest_tracker_exit_skips_sampling_without_streaming() {
+        // track_ram on but streaming off: nothing would render the samples, so
+        // sample_rss() is false and exit() must not read RSS.
+        let mut tracker =
+            InterestTracker::new(id(1), render_settings(true), FieldSettings::default(), {
+                let (w, _) = DynWriter::str();
+                w
+            });
+        tracker.new_span(vec![id(1)]);
+        tracker.open(
+            vec![id(1)],
+            SpanInfo {
+                name: "x",
+                start: UNIX_EPOCH,
+                end: None,
+                start_rss: RssSample::default(),
+                end_rss: RssSample::default(),
+            },
+        );
+        tracker.exit(vec![id(1)], UNIX_EPOCH + Duration::from_secs(1));
+        let span = tracker.span(vec![id(1)]);
+        let info = span.info.as_ref().expect("info set after open");
+        assert!(
+            info.end_rss.is_zero(),
+            "track_ram without streaming should not sample RSS: {:?}",
+            info.end_rss
+        );
     }
 }
 
