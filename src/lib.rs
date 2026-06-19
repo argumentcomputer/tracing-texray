@@ -16,10 +16,10 @@ use std::borrow::Cow;
 use parking_lot::lock_api::{MutexGuard, RawMutex};
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
-use std::io::{stderr, Write};
+use std::io::{Write, stderr};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use tracing::span::{Attributes, Record};
@@ -300,9 +300,10 @@ impl Settings {
 
     /// Sample process RSS on span enter/exit, surfaced on each span's
     /// [`streaming`](Self::streaming) close line as the RSS delta (`Δ`),
-    /// high-water mark (`peak`), and a machine-readable `peak-rss-bytes=<N>`
-    /// companion. Requires `streaming`: the close lines are the only consumer
-    /// of the samples, so with streaming off no RSS is sampled.
+    /// high-water mark (`peak`), and a `peak-rss-bytes=<N> (<X.YZ MiB>)`
+    /// companion (raw integer for CI/grep, formatted value for humans).
+    /// Requires `streaming`: the close lines are the only consumer of the
+    /// samples, so with streaming off no RSS is sampled.
     ///
     /// Sampling reads `/proc/self/status` once per span enter and once per
     /// exit (Linux only — zeros elsewhere).
@@ -490,9 +491,9 @@ impl TeXRayLayer {
 
     /// Sample process RSS on span enter/exit. Takes effect only with
     /// [`streaming`](Self::streaming), which surfaces each span's RSS delta and
-    /// peak plus a machine-readable `peak-rss-bytes=<N>` companion on its close
-    /// line; the close lines are the only consumer, so with streaming off no
-    /// RSS is sampled.
+    /// peak plus a `peak-rss-bytes=<N> (<X.YZ MiB>)` companion on its close
+    /// line (raw integer for CI/grep, formatted value for humans). The close
+    /// lines are the only consumer, so with streaming off no RSS is sampled.
     pub fn track_ram(mut self) -> Self {
         self.settings_mut().track_ram = true;
         self

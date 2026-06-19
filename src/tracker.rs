@@ -210,17 +210,19 @@ fn format_streaming_rss(start: RssSample, end: RssSample) -> String {
     )
 }
 
-/// Machine-readable companion to the streaming RSS suffix: a single raw byte
-/// count (peak RSS), with no unit conversion, for programmatic consumers that
-/// shouldn't have to parse the human-formatted timeline or summary graph.
-/// `None` when no RSS was sampled (peak 0) — non-Linux, or RAM tracking off.
+/// Machine-readable peak RSS line with a parenthesized human-formatted
+/// companion: `peak-rss-bytes=<N> (<X.YZ MiB>)`. The raw integer is for
+/// programmatic consumers (CI benchmarks, grep) and the formatted value is
+/// for eyeballing the same line. `None` when no RSS was sampled (peak 0)
+/// — non-Linux, or RAM tracking off.
 fn format_peak_rss_line(name: &str, peak_kb: u64) -> Option<String> {
     if peak_kb == 0 {
         return None;
     }
     Some(format!(
-        "[texray] {name} peak-rss-bytes={}",
-        peak_kb.saturating_mul(1024)
+        "[texray] {name} peak-rss-bytes={} ({})",
+        peak_kb.saturating_mul(1024),
+        format_bytes(peak_kb),
     ))
 }
 
@@ -368,13 +370,13 @@ impl SpanTracker {
     }
 
     /// Machine-readable companion to [`streaming_line`]: `[texray] <name>
-    /// peak-rss-bytes=<N>` (raw bytes). Lets streaming consumers read the peak
-    /// RSS as a single integer instead of parsing the human-formatted suffix.
+    /// peak-rss-bytes=<N> (<X.YZ MiB>)`. Lets streaming consumers grep the
+    /// peak RSS as a single integer while still being readable to humans.
     /// `None` when the span hasn't ended or no RSS was sampled.
     pub(crate) fn streaming_rss_line(&self) -> Option<String> {
         let info = self.info.as_ref()?;
         info.end?;
-        format_peak_rss_line(&info.name.to_string(), info.end_rss.peak_kb)
+        format_peak_rss_line(info.name, info.end_rss.peak_kb)
     }
 
     fn max_key_width(&self, depth: usize) -> usize {
@@ -734,11 +736,11 @@ mod test {
     use std::sync::Arc;
 
     use parking_lot::Mutex;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, UNIX_EPOCH};
 
     use crate::tracker::{
-        format_bytes, format_signed_kb, read_rss, width, FieldSettings, InterestTracker, RssSample,
-        SpanInfo, TrackedMetadata,
+        FieldSettings, InterestTracker, RssSample, SpanInfo, TrackedMetadata, format_bytes,
+        format_signed_kb, read_rss, width,
     };
     use tracing::Id;
 
@@ -776,16 +778,9 @@ mod test {
     }
 
     fn dump_to_string(id: Id, f: impl Fn(&mut InterestTracker)) -> String {
-        dump_to_string_with(id, render_settings(false), f)
-    }
-
-    fn dump_to_string_with(
-        id: Id,
-        settings: RenderSettings,
-        f: impl Fn(&mut InterestTracker),
-    ) -> String {
         let (writer, buf) = DynWriter::str();
-        let mut tracker = InterestTracker::new(id, settings, FieldSettings::default(), writer);
+        let mut tracker =
+            InterestTracker::new(id, render_settings(false), FieldSettings::default(), writer);
         f(&mut tracker);
         tracker.dump().unwrap();
         let mut buf = buf.lock();
@@ -926,29 +921,33 @@ test       10s  ├────────────────────�
     }
 
     #[test]
-    fn format_peak_rss_line_raw_bytes() {
-        // 4096 KiB peak -> 4194304 bytes, raw integer, no unit conversion.
+    fn format_peak_rss_line_bytes_with_human_suffix() {
+        // 4096 KiB peak -> 4194304 raw bytes plus a parenthesized human form.
         assert_eq!(
-            format_peak_rss_line("aiur/prove", 4096),
-            Some("[texray] aiur/prove peak-rss-bytes=4194304".to_string())
+            format_peak_rss_line("load_data", 4096),
+            Some("[texray] load_data peak-rss-bytes=4194304 (4.00 MiB)".to_string())
         );
         // Zero peak (non-Linux / RAM tracking off) emits nothing.
-        assert_eq!(format_peak_rss_line("aiur/prove", 0), None);
+        assert_eq!(format_peak_rss_line("load_data", 0), None);
     }
 
     #[test]
     fn rss_sample_is_zero() {
         assert!(RssSample::default().is_zero());
-        assert!(!RssSample {
-            current_kb: 1,
-            peak_kb: 0
-        }
-        .is_zero());
-        assert!(!RssSample {
-            current_kb: 0,
-            peak_kb: 1
-        }
-        .is_zero());
+        assert!(
+            !RssSample {
+                current_kb: 1,
+                peak_kb: 0
+            }
+            .is_zero()
+        );
+        assert!(
+            !RssSample {
+                current_kb: 0,
+                peak_kb: 1
+            }
+            .is_zero()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -982,24 +981,6 @@ test       10s  ├────────────────────�
     #[test]
     fn read_rss_returns_zero_off_linux() {
         assert!(read_rss().is_zero());
-    }
-
-    /// Build a SpanInfo with explicit RSS samples and a closed time range,
-    /// bypassing the live `read_rss()` call so render output is deterministic.
-    fn closed_span(
-        name: &'static str,
-        start: SystemTime,
-        end: SystemTime,
-        start_rss: RssSample,
-        end_rss: RssSample,
-    ) -> SpanInfo {
-        SpanInfo {
-            name,
-            start,
-            end: Some(end),
-            start_rss,
-            end_rss,
-        }
     }
 
     #[test]
