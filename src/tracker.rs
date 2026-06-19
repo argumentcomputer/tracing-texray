@@ -46,7 +46,7 @@ impl EventInfo {
 }
 
 impl SpanInfo {
-    pub(crate) fn for_span<S>(span: &Id, ctx: &Context<'_, S>, track_ram: bool) -> Self
+    pub(crate) fn for_span<S>(span: &Id, ctx: &Context<'_, S>, sample_rss: bool) -> Self
     where
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
@@ -57,7 +57,7 @@ impl SpanInfo {
                 .unwrap_or("could-not-find-span"),
             start: SystemTime::now(),
             end: None,
-            start_rss: if track_ram {
+            start_rss: if sample_rss {
                 read_rss()
             } else {
                 RssSample::default()
@@ -210,6 +210,22 @@ fn format_streaming_rss(start: RssSample, end: RssSample) -> String {
     )
 }
 
+/// Machine-readable peak RSS line with a parenthesized human-formatted
+/// companion: `peak-rss-bytes=<N> (<X.YZ MiB>)`. The raw integer is for
+/// programmatic consumers (CI benchmarks, grep) and the formatted value is
+/// for eyeballing the same line. `None` when no RSS was sampled (peak 0)
+/// — non-Linux, or RAM tracking off.
+fn format_peak_rss_line(name: &str, peak_kb: u64) -> Option<String> {
+    if peak_kb == 0 {
+        return None;
+    }
+    Some(format!(
+        "[texray] {name} peak-rss-bytes={} ({})",
+        peak_kb.saturating_mul(1024),
+        format_bytes(peak_kb),
+    ))
+}
+
 impl SpanInfo {
     fn full_name(&self, tracker: &SpanTracker, settings: &FieldSettings) -> String {
         let mut id = self.name.to_string();
@@ -353,6 +369,16 @@ impl SpanTracker {
         Some(format!("[texray] {}: {dur_fmt}{rss_suffix}", info.name))
     }
 
+    /// Machine-readable companion to [`streaming_line`]: `[texray] <name>
+    /// peak-rss-bytes=<N> (<X.YZ MiB>)`. Lets streaming consumers grep the
+    /// peak RSS as a single integer while still being readable to humans.
+    /// `None` when the span hasn't ended or no RSS was sampled.
+    pub(crate) fn streaming_rss_line(&self) -> Option<String> {
+        let info = self.info.as_ref()?;
+        info.end?;
+        format_peak_rss_line(info.name, info.end_rss.peak_kb)
+    }
+
     fn max_key_width(&self, depth: usize) -> usize {
         let longest_self = self
             .info
@@ -436,28 +462,35 @@ impl InterestTracker {
     }
 
     pub(crate) fn exit(&mut self, path: Vec<Id>, timestamp: SystemTime) {
-        let end_rss = if self.render_settings.track_ram {
+        let end_rss = if self.sample_rss() {
             read_rss()
         } else {
             RssSample::default()
         };
         let streaming = self.render_settings.streaming;
-        let line = {
+        let (line, rss_line) = {
             let span = self.span(path);
             span.exit(timestamp, end_rss);
             if streaming {
-                span.streaming_line()
+                (span.streaming_line(), span.streaming_rss_line())
             } else {
-                None
+                (None, None)
             }
         };
+        let mut out = self.out.inner.lock();
         if let Some(line) = line {
-            let _ = writeln!(self.out.inner.lock(), "{line}");
+            let _ = writeln!(out, "{line}");
+        }
+        if let Some(rss_line) = rss_line {
+            let _ = writeln!(out, "{rss_line}");
         }
     }
 
-    pub(crate) fn track_ram(&self) -> bool {
-        self.render_settings.track_ram
+    /// Whether to sample RSS: only when RAM tracking and streaming are both on.
+    /// The streaming close lines are the only consumer of RSS samples, so with
+    /// streaming off the per-span `/proc` reads would be wasted.
+    pub(crate) fn sample_rss(&self) -> bool {
+        self.render_settings.track_ram && self.render_settings.streaming
     }
 
     fn spans(&self) -> impl Iterator<Item = &SpanInfo> {
@@ -522,81 +555,6 @@ impl InterestTracker {
             }
         }
 
-        if settings.track_ram {
-            self.render_ram(out.deref_mut(), &ordered)?;
-        }
-
-        Ok(())
-    }
-
-    fn render_ram(
-        &self,
-        mut out: impl Write,
-        ordered: &[(&Vec<Id>, &SpanTracker)],
-    ) -> io::Result<()> {
-        let any_rss = ordered.iter().any(|(_, track)| {
-            track
-                .info
-                .as_ref()
-                .map(|info| !info.start_rss.is_zero() || !info.end_rss.is_zero())
-                .unwrap_or(false)
-        });
-        if !any_rss {
-            return Ok(());
-        }
-
-        let mut rows: Vec<(String, String, String)> = Vec::with_capacity(ordered.len());
-        let mut max_label = 0;
-        let mut max_delta = 0;
-        for (key, track) in ordered {
-            let Some(info) = track.info.as_ref() else {
-                continue;
-            };
-            // Mirror the bar chart's `min_duration` filter so the RAM block
-            // doesn't list rows that aren't shown in the timeline above.
-            if let Some(min) = self.render_settings.min_duration.as_ref() {
-                let span_len = match info.duration() {
-                    None => continue,
-                    Some(d) => d,
-                };
-                if &span_len < min {
-                    continue;
-                }
-            }
-            let depth = key.len().saturating_sub(1);
-            let label = format!(
-                "{}{}",
-                " ".repeat(NESTED_EVENT_OFFSET * depth),
-                info.full_name(track, &self.field_settings),
-            );
-            // Show start→end RSS (the trajectory) so transient allocations
-            // are visible: a span whose end is well below its peak freed
-            // memory before exiting. Append the net delta in parens so it's
-            // also legible at a glance.
-            let delta = format!(
-                "RSS {} → {} (Δ {})",
-                format_bytes(info.start_rss.current_kb),
-                format_bytes(info.end_rss.current_kb),
-                format_signed_kb(info.start_rss.current_kb, info.end_rss.current_kb),
-            );
-            let peak = format!("peak {}", format_bytes(info.end_rss.peak_kb));
-            max_label = max_label.max(label.chars().count());
-            max_delta = max_delta.max(delta.chars().count());
-            rows.push((label, delta, peak));
-        }
-
-        writeln!(out)?;
-        writeln!(out, "RAM:")?;
-        for (label, delta, peak) in rows {
-            let label_pad = max_label - label.chars().count();
-            let delta_pad = max_delta - delta.chars().count();
-            writeln!(
-                out,
-                "  {label}{}  {delta}{}  {peak}",
-                " ".repeat(label_pad),
-                " ".repeat(delta_pad),
-            )?;
-        }
         Ok(())
     }
 
@@ -687,7 +645,7 @@ impl RootTracker {
         let Some(interest_tracker) = span_guard.get_mut(id) else {
             return;
         };
-        let track_ram = interest_tracker.render_settings.track_ram;
+        let sample_rss = interest_tracker.sample_rss();
         let field_settings = interest_tracker.field_settings.clone();
         let key = vec![id.clone()];
         let span_tracker = interest_tracker
@@ -695,7 +653,7 @@ impl RootTracker {
             .entry(key)
             .or_insert_with(|| SpanTracker::new(field_settings));
         if span_tracker.info.is_none() {
-            let start_rss = if track_ram {
+            let start_rss = if sample_rss {
                 read_rss()
             } else {
                 RssSample::default()
@@ -768,7 +726,7 @@ impl Default for FieldSettings {
 
 #[cfg(test)]
 mod test {
-    use super::{format_streaming_duration, format_streaming_rss};
+    use super::{format_peak_rss_line, format_streaming_duration, format_streaming_rss};
     use crate::{DynWriter, RenderSettings, Settings};
     use std::io::{BufWriter, Write};
 
@@ -778,7 +736,7 @@ mod test {
     use std::sync::Arc;
 
     use parking_lot::Mutex;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, UNIX_EPOCH};
 
     use crate::tracker::{
         FieldSettings, InterestTracker, RssSample, SpanInfo, TrackedMetadata, format_bytes,
@@ -820,16 +778,9 @@ mod test {
     }
 
     fn dump_to_string(id: Id, f: impl Fn(&mut InterestTracker)) -> String {
-        dump_to_string_with(id, render_settings(false), f)
-    }
-
-    fn dump_to_string_with(
-        id: Id,
-        settings: RenderSettings,
-        f: impl Fn(&mut InterestTracker),
-    ) -> String {
         let (writer, buf) = DynWriter::str();
-        let mut tracker = InterestTracker::new(id, settings, FieldSettings::default(), writer);
+        let mut tracker =
+            InterestTracker::new(id, render_settings(false), FieldSettings::default(), writer);
         f(&mut tracker);
         tracker.dump().unwrap();
         let mut buf = buf.lock();
@@ -970,6 +921,17 @@ test       10s  ├────────────────────�
     }
 
     #[test]
+    fn format_peak_rss_line_bytes_with_human_suffix() {
+        // 4096 KiB peak -> 4194304 raw bytes plus a parenthesized human form.
+        assert_eq!(
+            format_peak_rss_line("load_data", 4096),
+            Some("[texray] load_data peak-rss-bytes=4194304 (4.00 MiB)".to_string())
+        );
+        // Zero peak (non-Linux / RAM tracking off) emits nothing.
+        assert_eq!(format_peak_rss_line("load_data", 0), None);
+    }
+
+    #[test]
     fn rss_sample_is_zero() {
         assert!(RssSample::default().is_zero());
         assert!(
@@ -1021,195 +983,6 @@ test       10s  ├────────────────────�
         assert!(read_rss().is_zero());
     }
 
-    /// Build a SpanInfo with explicit RSS samples and a closed time range,
-    /// bypassing the live `read_rss()` call so render output is deterministic.
-    fn closed_span(
-        name: &'static str,
-        start: SystemTime,
-        end: SystemTime,
-        start_rss: RssSample,
-        end_rss: RssSample,
-    ) -> SpanInfo {
-        SpanInfo {
-            name,
-            start,
-            end: Some(end),
-            start_rss,
-            end_rss,
-        }
-    }
-
-    #[test]
-    fn render_ram_block_present_with_samples() {
-        let interval_start = UNIX_EPOCH;
-        let output = dump_to_string_with(id(1), render_settings(true), |tracker| {
-            tracker.new_span(vec![id(1)]);
-            tracker.new_span(vec![id(1), id(2)]);
-            tracker.open(
-                vec![id(1)],
-                closed_span(
-                    "outer",
-                    interval_start,
-                    interval_start + Duration::from_secs(10),
-                    RssSample {
-                        current_kb: 1024,
-                        peak_kb: 1024,
-                    },
-                    RssSample {
-                        current_kb: 3072,
-                        peak_kb: 4096,
-                    },
-                ),
-            );
-            tracker.open(
-                vec![id(1), id(2)],
-                closed_span(
-                    "inner",
-                    interval_start + Duration::from_secs(2),
-                    interval_start + Duration::from_secs(7),
-                    RssSample {
-                        current_kb: 2048,
-                        peak_kb: 2048,
-                    },
-                    RssSample {
-                        current_kb: 1024,
-                        peak_kb: 4096,
-                    },
-                ),
-            );
-        });
-
-        assert!(output.contains("RAM:"), "missing RAM header in:\n{output}");
-        assert!(
-            output.contains("  outer    RSS 1.00 MiB → 3.00 MiB (Δ +2.00 MiB)  peak 4.00 MiB"),
-            "missing outer row in:\n{output}"
-        );
-        assert!(
-            output.contains("    inner  RSS 2.00 MiB → 1.00 MiB (Δ -1.00 MiB)  peak 4.00 MiB"),
-            "missing inner row in:\n{output}"
-        );
-        // RAM block must come after the bar chart (parent first, child indented).
-        let bar_pos = output.find("outer").expect("bar row");
-        let ram_pos = output.find("RAM:").expect("ram header");
-        assert!(bar_pos < ram_pos, "RAM block must follow bars:\n{output}");
-        assert!(
-            output.find("outer").map(|p| p < ram_pos).unwrap_or(false)
-                && output.rfind("outer").map(|p| p > ram_pos).unwrap_or(false),
-            "outer should appear in both bar and RAM sections:\n{output}"
-        );
-    }
-
-    #[test]
-    fn render_ram_block_respects_min_duration() {
-        // `min_duration` should filter both the bar chart and the RAM block
-        // so they stay consistent. A short span should be hidden in both.
-        let mut settings = render_settings(true);
-        settings.min_duration = Some(Duration::from_millis(5));
-        let interval_start = UNIX_EPOCH;
-        let output = dump_to_string_with(id(1), settings, |tracker| {
-            tracker.new_span(vec![id(1)]);
-            tracker.new_span(vec![id(1), id(2)]);
-            // Long parent: kept.
-            tracker.open(
-                vec![id(1)],
-                closed_span(
-                    "outer",
-                    interval_start,
-                    interval_start + Duration::from_millis(100),
-                    RssSample {
-                        current_kb: 1024,
-                        peak_kb: 1024,
-                    },
-                    RssSample {
-                        current_kb: 3072,
-                        peak_kb: 4096,
-                    },
-                ),
-            );
-            // Sub-millisecond child: filtered.
-            tracker.open(
-                vec![id(1), id(2)],
-                closed_span(
-                    "inner_short",
-                    interval_start + Duration::from_millis(10),
-                    interval_start + Duration::from_millis(11),
-                    RssSample {
-                        current_kb: 2048,
-                        peak_kb: 2048,
-                    },
-                    RssSample {
-                        current_kb: 1024,
-                        peak_kb: 4096,
-                    },
-                ),
-            );
-        });
-
-        assert!(output.contains("RAM:"), "missing RAM header in:\n{output}");
-        let ram_pos = output.find("RAM:").expect("ram header");
-        let ram_block = &output[ram_pos..];
-        assert!(
-            ram_block.contains("outer"),
-            "outer (100ms) should appear in RAM block:\n{output}"
-        );
-        assert!(
-            !ram_block.contains("inner_short"),
-            "inner_short (1ms) should be filtered by min_duration=5ms in RAM block:\n{output}"
-        );
-    }
-
-    #[test]
-    fn render_ram_block_skipped_when_disabled() {
-        let interval_start = UNIX_EPOCH;
-        let output = dump_to_string_with(id(1), render_settings(false), |tracker| {
-            tracker.new_span(vec![id(1)]);
-            tracker.open(
-                vec![id(1)],
-                closed_span(
-                    "outer",
-                    interval_start,
-                    interval_start + Duration::from_secs(1),
-                    RssSample {
-                        current_kb: 1024,
-                        peak_kb: 1024,
-                    },
-                    RssSample {
-                        current_kb: 2048,
-                        peak_kb: 2048,
-                    },
-                ),
-            );
-        });
-        assert!(
-            !output.contains("RAM:"),
-            "RAM block should be absent when track_ram=false:\n{output}"
-        );
-    }
-
-    #[test]
-    fn render_ram_block_skipped_when_all_samples_zero() {
-        // track_ram is on but no real samples were taken (e.g. non-Linux);
-        // we should not print a misleading all-zero RAM block.
-        let interval_start = UNIX_EPOCH;
-        let output = dump_to_string_with(id(1), render_settings(true), |tracker| {
-            tracker.new_span(vec![id(1)]);
-            tracker.open(
-                vec![id(1)],
-                closed_span(
-                    "outer",
-                    interval_start,
-                    interval_start + Duration::from_secs(1),
-                    RssSample::default(),
-                    RssSample::default(),
-                ),
-            );
-        });
-        assert!(
-            !output.contains("RAM:"),
-            "RAM block should be absent when all samples are zero:\n{output}"
-        );
-    }
-
     #[test]
     fn span_info_for_span_samples_when_enabled() {
         // Without a real tracing Subscriber we can't call SpanInfo::for_span
@@ -1234,13 +1007,21 @@ test       10s  ├────────────────────�
     }
 
     #[test]
-    fn interest_tracker_exit_samples_when_track_ram() {
-        // exit() should record a non-zero end_rss when track_ram is on, on Linux.
-        let mut tracker =
-            InterestTracker::new(id(1), render_settings(true), FieldSettings::default(), {
+    fn interest_tracker_exit_samples_when_tracking_and_streaming() {
+        // exit() records a non-zero end_rss only when track_ram and streaming
+        // are both on (RSS is consumed by the streaming lines); Linux only.
+        let mut tracker = InterestTracker::new(
+            id(1),
+            RenderSettings {
+                streaming: true,
+                ..render_settings(true)
+            },
+            FieldSettings::default(),
+            {
                 let (w, _) = DynWriter::str();
                 w
-            });
+            },
+        );
         tracker.new_span(vec![id(1)]);
         tracker.open(
             vec![id(1)],
@@ -1287,6 +1068,36 @@ test       10s  ├────────────────────�
         let span = tracker.span(vec![id(1)]);
         let info = span.info.as_ref().expect("info set after open");
         assert!(info.end_rss.is_zero());
+    }
+
+    #[test]
+    fn interest_tracker_exit_skips_sampling_without_streaming() {
+        // track_ram on but streaming off: nothing would render the samples, so
+        // sample_rss() is false and exit() must not read RSS.
+        let mut tracker =
+            InterestTracker::new(id(1), render_settings(true), FieldSettings::default(), {
+                let (w, _) = DynWriter::str();
+                w
+            });
+        tracker.new_span(vec![id(1)]);
+        tracker.open(
+            vec![id(1)],
+            SpanInfo {
+                name: "x",
+                start: UNIX_EPOCH,
+                end: None,
+                start_rss: RssSample::default(),
+                end_rss: RssSample::default(),
+            },
+        );
+        tracker.exit(vec![id(1)], UNIX_EPOCH + Duration::from_secs(1));
+        let span = tracker.span(vec![id(1)]);
+        let info = span.info.as_ref().expect("info set after open");
+        assert!(
+            info.end_rss.is_zero(),
+            "track_ram without streaming should not sample RSS: {:?}",
+            info.end_rss
+        );
     }
 }
 

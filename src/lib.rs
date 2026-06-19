@@ -298,9 +298,12 @@ impl Settings {
         self
     }
 
-    /// Sample process RSS on span enter/exit and print a `RAM:` block below
-    /// the timeline. Each row shows the net RSS delta (`Δ`) for the span and
-    /// the high-water mark (`peak`) reached during it.
+    /// Sample process RSS on span enter/exit, surfaced on each span's
+    /// [`streaming`](Self::streaming) close line as the RSS delta (`Δ`),
+    /// high-water mark (`peak`), and a `peak-rss-bytes=<N> (<X.YZ MiB>)`
+    /// companion (raw integer for CI/grep, formatted value for humans).
+    /// Requires `streaming`: the close lines are the only consumer of the
+    /// samples, so with streaming off no RSS is sampled.
     ///
     /// Sampling reads `/proc/self/status` once per span enter and once per
     /// exit (Linux only — zeros elsewhere).
@@ -486,9 +489,11 @@ impl TeXRayLayer {
         self
     }
 
-    /// Enable RSS sampling. Each examined span will record current and peak
-    /// resident-set size on enter and exit, and a `RAM:` block will be
-    /// printed below the timeline showing per-span deltas and peaks.
+    /// Sample process RSS on span enter/exit. Takes effect only with
+    /// [`streaming`](Self::streaming), which surfaces each span's RSS delta and
+    /// peak plus a `peak-rss-bytes=<N> (<X.YZ MiB>)` companion on its close
+    /// line (raw integer for CI/grep, formatted value for humans). The close
+    /// lines are the only consumer, so with streaming off no RSS is sampled.
     pub fn track_ram(mut self) -> Self {
         self.settings_mut().track_ram = true;
         self
@@ -606,7 +611,7 @@ where
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
         check_initialized!(self);
         self.for_tracker(id, &ctx, |tracker, path| {
-            let info = SpanInfo::for_span(id, &ctx, tracker.track_ram());
+            let info = SpanInfo::for_span(id, &ctx, tracker.sample_rss());
             tracker.open(path, info);
             Action::DoNothing
         });

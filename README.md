@@ -117,33 +117,53 @@ do_a_thing           509μs ├────────────────�
    >buzz                                                                   ┼
 ```
 
-## RAM tracking
+## Streaming mode
 
-`TeXRayLayer::track_ram()` enables per-span RSS sampling. Each examined span
-records the process's resident-set size on entry and exit, plus the
-high-water mark (`VmHWM`). Below the timeline, a `RAM:` block shows the
-trajectory and peak per span:
+`TeXRayLayer::streaming()` emits a one-line summary to the layer's writer as
+each examined span closes, in addition to the timeline printed when the
+`examine`'d root exits:
 
 ```rust
 use tracing_texray::TeXRayLayer;
 
-let layer = TeXRayLayer::new().track_ram();
+let layer = TeXRayLayer::new().streaming();
 # drop(layer);
 ```
 
 ```text
-prove                          1.4s ├──────────────────────────────────────┤
-  stage1_commit                30ms ├─┤
-  ...
-
-RAM:
-  prove           RSS 320.00 MiB → 338.00 MiB (Δ +18.00 MiB)   peak 471.96 MiB
-    stage1_commit RSS 320.00 MiB → 368.00 MiB (Δ +48.00 MiB)   peak 371.90 MiB
-    ...
+[texray] download_results: 11.23ms
+[texray] load_data: 52.08ms
 ```
 
-The `RSS start → end` trajectory plus the `peak` make transient allocations
-visible: a span ending well below its peak (e.g. `prove` above ending at
-338 MiB but peaking at 472) freed memory before exiting. RSS sampling reads
-`/proc/self/status`, so it's Linux-only — non-Linux samples report zero and
-the `RAM:` block is suppressed.
+## RAM tracking
+
+`TeXRayLayer::track_ram()` samples the process's resident-set size
+(`VmRSS`) and high-water mark (`VmHWM`) on each examined span's enter/exit.
+RAM tracking **requires `streaming()`** — the streaming close lines are the
+only consumer of the samples, so without streaming `track_ram()` is a no-op
+and no sampling happens.
+
+```rust
+use tracing_texray::TeXRayLayer;
+
+let layer = TeXRayLayer::new().streaming().track_ram();
+# drop(layer);
+```
+
+Each close line gains a `── RAM Δ <delta> peak <hwm>` suffix, followed by a
+`peak-rss-bytes=<N> (<X.YZ MiB>)` line — the raw integer is easy for CI
+benchmarks to grep, and the parenthesized human format is readable on the
+same line:
+
+```text
+[texray] download_results: 11.23ms  ── RAM Δ +48.00 MiB peak 371.90 MiB
+[texray] download_results peak-rss-bytes=389971148 (371.90 MiB)
+[texray] load_data: 52.08ms  ── RAM Δ +18.00 MiB peak 471.96 MiB
+[texray] load_data peak-rss-bytes=494917386 (471.96 MiB)
+```
+
+The `Δ` plus `peak` make transient allocations visible: a span with `peak`
+well above its net `Δ` (e.g. `load_data` above with Δ +18 MiB but peak
+472 MiB) allocated and freed memory during the span. RSS sampling reads
+`/proc/self/status`, so it's Linux-only — elsewhere the samples are zero
+and the RAM suffix and `peak-rss-bytes` line are both omitted.
