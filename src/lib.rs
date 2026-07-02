@@ -7,6 +7,8 @@
     unreachable_pub
 )]
 
+pub mod json_sink;
+pub mod rss_sampler;
 mod tracked_spans;
 mod tracker;
 
