@@ -67,8 +67,7 @@ mod tests {
     /// naming that span with a positive duration.
     #[test]
     fn records_examined_span_timing() {
-        let path =
-            std::env::temp_dir().join(format!("texray_sink_{}.jsonl", std::process::id()));
+        let path = std::env::temp_dir().join(format!("texray_sink_{}.jsonl", std::process::id()));
         let p = path.to_str().unwrap();
         to_file(p).unwrap();
 
@@ -83,8 +82,7 @@ mod tests {
         *SINK.lock() = None; // release the file so other tests don't append
         let _ = std::fs::remove_file(p);
         assert!(
-            contents.contains("\"span\":\"phase/demo\"")
-                && contents.contains("\"seconds\":"),
+            contents.contains("\"span\":\"phase/demo\"") && contents.contains("\"seconds\":"),
             "sink did not record the span: {contents:?}",
         );
     }

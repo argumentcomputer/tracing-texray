@@ -73,8 +73,7 @@ fn current_tree_rss_bytes() -> u64 {
             continue;
         };
         // A process can exit mid-scan; a failed read just drops that PID.
-        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status"))
-        else {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
             continue;
         };
         let mut ppid = 0u32;
@@ -131,23 +130,50 @@ fn parse_kb(s: &str) -> u64 {
 mod tests {
     use super::*;
 
+    /// Env var that flips this test binary into "child" mode: allocate and
+    /// touch ~200 MB, linger, then exit. Set by the parent invocation on the
+    /// child it spawns (see below).
+    const RSS_CHILD_ENV: &str = "TEXRAY_RSS_SAMPLER_CHILD";
+
     /// The tree peak must include memory resident in a *child* process — the
     /// property `/proc/self/status` alone can't provide and the reason this
     /// sampler exists.
+    ///
+    /// The child is a re-exec of this very test binary (`current_exe`) rather
+    /// than an external interpreter, so the test has no dependency outside the
+    /// crate's own build — it runs identically on a minimal CI image or a Nix
+    /// shell with no `python3` on PATH.
     #[test]
     fn tree_peak_includes_child_process() {
+        // Child role: hold ~200 MB resident, then sleep long enough for the
+        // parent's sampler to observe it. `black_box` + page touching keep the
+        // allocation from being optimized away or left non-resident.
+        if std::env::var_os(RSS_CHILD_ENV).is_some() {
+            let mut buf = vec![0u8; 200 * 1024 * 1024];
+            let mut i = 0;
+            while i < buf.len() {
+                buf[i] = 1;
+                i += 4096;
+            }
+            std::hint::black_box(&buf);
+            std::thread::sleep(Duration::from_millis(1500));
+            return;
+        }
+
         start(Duration::from_millis(20));
-        // A child that touches ~200 MB so the pages are actually resident, then
-        // lingers long enough to be sampled. `python3` is available on CI/dev.
-        let mut child = std::process::Command::new("python3")
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(exe)
+            // Re-run exactly this test in the child; the env var makes it take
+            // the allocate-and-sleep branch above instead of spawning again.
             .args([
-                "-c",
-                "b=bytearray(200*1024*1024)\n\
-                 for i in range(0,len(b),4096): b[i]=1\n\
-                 import time; time.sleep(1.5)",
+                "--exact",
+                "rss_sampler::tests::tree_peak_includes_child_process",
             ])
+            .env(RSS_CHILD_ENV, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn child");
+            .expect("spawn child test binary");
         std::thread::sleep(Duration::from_millis(800));
         let peak = peak_tree_rss_bytes();
         let _ = child.wait();
