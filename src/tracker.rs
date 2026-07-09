@@ -379,6 +379,15 @@ impl SpanTracker {
         format_peak_rss_line(info.name, info.end_rss.peak_kb)
     }
 
+    /// Raw `(name, seconds)` for a closed span — the JSON sink's source.
+    /// `None` if the span has no recorded info or hasn't ended.
+    pub(crate) fn timing(&self) -> Option<(&'static str, f64)> {
+        let info = self.info.as_ref()?;
+        let end = info.end?;
+        let duration = end.duration_since(info.start).ok()?;
+        Some((info.name, duration.as_secs_f64()))
+    }
+
     fn max_key_width(&self, depth: usize) -> usize {
         let longest_self = self
             .info
@@ -468,9 +477,15 @@ impl InterestTracker {
             RssSample::default()
         };
         let streaming = self.render_settings.streaming;
+        let json = crate::json_sink::is_active();
         let (line, rss_line) = {
             let span = self.span(path);
             span.exit(timestamp, end_rss);
+            if json {
+                if let Some((name, secs)) = span.timing() {
+                    crate::json_sink::record(name, secs);
+                }
+            }
             if streaming {
                 (span.streaming_line(), span.streaming_rss_line())
             } else {
