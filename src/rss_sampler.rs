@@ -13,12 +13,58 @@
 //! peak regardless of where the memory actually lives. Linux-only; on other
 //! platforms the peak stays `0`.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 static PEAK_TREE_RSS_BYTES: AtomicU64 = AtomicU64::new(0);
 static SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
+/// Every open [`SpanPeak`]: each sample raises all of them.
+static OPEN_SPANS: Mutex<Vec<Arc<AtomicU64>>> = Mutex::new(Vec::new());
+
+/// Tests that measure this process tree's memory hold this while they do,
+/// so one test's allocations do not land in another's peak.
+#[cfg(test)]
+pub(crate) static MEMORY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// The sampling period the sampler starts with when a span first asks for a
+/// peak and nothing started it explicitly.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The peak tree RSS observed while one span is open: a slot the sampler
+/// raises on every tick from the moment [`watch`] creates it until it is
+/// dropped. Nested and overlapping spans each hold their own slot, so a
+/// child's peak never leaks into a sibling's, and a parent's peak covers its
+/// children's.
+#[derive(Debug)]
+pub struct SpanPeak(Arc<AtomicU64>);
+
+impl SpanPeak {
+    /// The highest tree RSS (bytes) sampled since the slot was created,
+    /// seeded with the RSS at creation.
+    pub fn bytes(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for SpanPeak {
+    fn drop(&mut self) {
+        OPEN_SPANS.lock().retain(|slot| !Arc::ptr_eq(slot, &self.0));
+    }
+}
+
+/// Begin watching the tree RSS for a span, starting the sampler at
+/// [`DEFAULT_INTERVAL`] if nothing has yet. `current_bytes` seeds the peak
+/// (the caller has usually just read it), so a span shorter than one
+/// sampling period still reports at least its starting RSS.
+pub fn watch(current_bytes: u64) -> SpanPeak {
+    start(DEFAULT_INTERVAL);
+    let slot = Arc::new(AtomicU64::new(current_bytes));
+    OPEN_SPANS.lock().push(Arc::clone(&slot));
+    SpanPeak(slot)
+}
 
 /// Peak total resident-set size (bytes) observed across this process's tree
 /// since the sampler started (or since the last [`reset_peak_tree_rss`]). `0`
@@ -55,6 +101,9 @@ pub fn start(interval: Duration) {
 
 fn bump_peak(sample: u64) {
     PEAK_TREE_RSS_BYTES.fetch_max(sample, Ordering::Relaxed);
+    for slot in OPEN_SPANS.lock().iter() {
+        slot.fetch_max(sample, Ordering::Relaxed);
+    }
 }
 
 /// Sum `VmRSS` (bytes) over this process and every transitive descendant, from
@@ -160,6 +209,7 @@ mod tests {
             return;
         }
 
+        let _serial = MEMORY_TEST_LOCK.lock();
         start(Duration::from_millis(20));
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = std::process::Command::new(exe)
