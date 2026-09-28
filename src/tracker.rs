@@ -63,7 +63,20 @@ impl SpanInfo {
                 RssSample::default()
             },
             end_rss: RssSample::default(),
+            peak: None,
         }
+        .watched(sample_rss)
+    }
+
+    /// Starts the sampler's watch on this span, seeded with its starting
+    /// RSS, when RSS is being sampled.
+    fn watched(mut self, sample_rss: bool) -> Self {
+        if sample_rss {
+            self.peak = Some(crate::rss_sampler::watch(
+                self.start_rss.current_kb.saturating_mul(1024),
+            ));
+        }
+        self
     }
 }
 
@@ -102,20 +115,27 @@ impl TrackedMetadata {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct SpanInfo {
     start: SystemTime,
     end: Option<SystemTime>,
     name: &'static str,
     start_rss: RssSample,
     end_rss: RssSample,
+    /// The sampler's watch on this span while it is open; taken at exit to
+    /// fill `end_rss.peak_kb`.
+    peak: Option<crate::rss_sampler::SpanPeak>,
 }
 
-/// Snapshot of process resident-set size, in kilobytes.
+/// Snapshot of resident-set size, in kilobytes.
 ///
-/// `current_kb` is `VmRSS` (live RSS at sample time); `peak_kb` is `VmHWM`
-/// (the highest RSS the process has reached). Both are zero on non-Linux
-/// platforms — there's no portable equivalent of `/proc/self/status`.
+/// `current_kb` is `VmRSS` (this process's live RSS at sample time).
+/// `peak_kb` is meaningful on a span's end sample only: the highest
+/// process-tree RSS seen while the span was open, per the
+/// [`crate::rss_sampler`] — not the process high-water mark, which never
+/// falls and so would credit every later span with the largest earlier one.
+/// Both are zero on non-Linux platforms — there's no portable equivalent of
+/// `/proc/self/status`.
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct RssSample {
     current_kb: u64,
@@ -137,8 +157,7 @@ pub(crate) fn read_rss() -> RssSample {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             sample.current_kb = parse_kb(rest);
-        } else if let Some(rest) = line.strip_prefix("VmHWM:") {
-            sample.peak_kb = parse_kb(rest);
+            break;
         }
     }
     sample
@@ -344,10 +363,17 @@ impl SpanTracker {
         }
     }
 
-    fn exit(&mut self, timestamp: SystemTime, end_rss: RssSample) {
+    fn exit(&mut self, timestamp: SystemTime, mut end_rss: RssSample) {
         match &mut self.info {
             Some(info) => {
                 info.end = Some(timestamp);
+                // The span's own peak: what the sampler saw while it was
+                // open, and never less than either end of it.
+                if let Some(peak) = info.peak.take() {
+                    end_rss.peak_kb = (peak.bytes() / 1024)
+                        .max(info.start_rss.current_kb)
+                        .max(end_rss.current_kb);
+                }
                 info.end_rss = end_rss;
             }
             None => eprintln!("this is a bug"), //
@@ -673,13 +699,17 @@ impl RootTracker {
             } else {
                 RssSample::default()
             };
-            span_tracker.info = Some(SpanInfo {
-                name,
-                start: SystemTime::now(),
-                end: None,
-                start_rss,
-                end_rss: RssSample::default(),
-            });
+            span_tracker.info = Some(
+                SpanInfo {
+                    name,
+                    start: SystemTime::now(),
+                    end: None,
+                    start_rss,
+                    end_rss: RssSample::default(),
+                    peak: None,
+                }
+                .watched(sample_rss),
+            );
         }
     }
 
@@ -843,6 +873,7 @@ mod test {
                     end: None,
                     start_rss: RssSample::default(),
                     end_rss: RssSample::default(),
+                    peak: None,
                 },
             );
             tracker.open(
@@ -853,6 +884,7 @@ mod test {
                     end: None,
                     start_rss: RssSample::default(),
                     end_rss: RssSample::default(),
+                    peak: None,
                 },
             );
             tracker.exit(vec![id(1), id(2)], interval_start + Duration::from_secs(7));
@@ -978,18 +1010,14 @@ test       10s  ├────────────────────�
     #[cfg(target_os = "linux")]
     #[test]
     fn read_rss_returns_live_sample() {
-        // The test process is real; VmRSS must be non-zero and VmHWM >= VmRSS.
+        // The test process is real; VmRSS must be non-zero. The peak is
+        // a span-exit quantity, not part of a live sample.
         let sample = read_rss();
         assert!(
             sample.current_kb > 0,
             "expected non-zero current RSS, got {sample:?}"
         );
-        assert!(
-            sample.peak_kb >= sample.current_kb,
-            "peak ({}) should be >= current ({})",
-            sample.peak_kb,
-            sample.current_kb
-        );
+        assert_eq!(sample.peak_kb, 0);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1046,6 +1074,7 @@ test       10s  ├────────────────────�
                 end: None,
                 start_rss: RssSample::default(),
                 end_rss: RssSample::default(),
+                peak: None,
             },
         );
         tracker.exit(vec![id(1)], UNIX_EPOCH + Duration::from_secs(1));
@@ -1077,6 +1106,7 @@ test       10s  ├────────────────────�
                 end: None,
                 start_rss: RssSample::default(),
                 end_rss: RssSample::default(),
+                peak: None,
             },
         );
         tracker.exit(vec![id(1)], UNIX_EPOCH + Duration::from_secs(1));
@@ -1103,6 +1133,7 @@ test       10s  ├────────────────────�
                 end: None,
                 start_rss: RssSample::default(),
                 end_rss: RssSample::default(),
+                peak: None,
             },
         );
         tracker.exit(vec![id(1)], UNIX_EPOCH + Duration::from_secs(1));
@@ -1146,4 +1177,43 @@ fn width(chars: usize, outer: Duration, inner: Duration) -> usize {
     }
     let ratio = inner.as_secs_f64() / outer.as_secs_f64();
     (ratio * chars as f64).round() as usize
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod span_peak_tests {
+    use super::read_rss;
+    use crate::rss_sampler;
+
+    /// A watched span sees a spike held longer than a sampling period even
+    /// though the memory is gone by the time it exits, and a sibling opened
+    /// afterwards does not.
+    #[test]
+    fn span_peak_is_the_spans_own() {
+        let _serial = rss_sampler::MEMORY_TEST_LOCK.lock();
+        let before = read_rss().current_kb.saturating_mul(1024);
+        let spike = rss_sampler::watch(before);
+        let bytes = 256usize << 20;
+        let mut held = vec![0u8; bytes];
+        for i in (0..bytes).step_by(4096) {
+            held[i] = 1;
+        }
+        std::hint::black_box(&held);
+        std::thread::sleep(rss_sampler::DEFAULT_INTERVAL * 4);
+        drop(held);
+        std::thread::sleep(rss_sampler::DEFAULT_INTERVAL * 4);
+        let after = read_rss().current_kb.saturating_mul(1024);
+        let sibling = rss_sampler::watch(after);
+        std::thread::sleep(rss_sampler::DEFAULT_INTERVAL * 2);
+        let half = bytes as u64 / 2;
+        assert!(
+            spike.bytes() >= before + half,
+            "spike peak {} should cover the {bytes}-byte hold over {before}",
+            spike.bytes()
+        );
+        assert!(
+            sibling.bytes() < before + half,
+            "sibling peak {} should not include the earlier hold",
+            sibling.bytes()
+        );
+    }
 }
